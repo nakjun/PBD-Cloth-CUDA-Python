@@ -1,0 +1,6 @@
+*.ini
+*.blend
+*.blend1
+*.obj
+__pycache__
+venv
