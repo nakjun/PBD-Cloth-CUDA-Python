@@ -7,3 +7,4 @@ venv
 *.vrew
 *.mkv
 *.npz
+dataset_*
