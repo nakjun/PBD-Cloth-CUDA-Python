@@ -45,19 +45,11 @@ class CollisionPredictor(nn.Module):
         # 입력: 4 (vx, vy, vz, compression_ratio)
         # 출력: 1 (충돌 확률)
         self.net = nn.Sequential(
-            nn.Linear(4, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(4, 32), # <--- 여기가 핵심 변경점일세!
             nn.ReLU(),
             nn.Linear(32, 16),
-            nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
+            nn.Linear(16, 1),
             nn.Sigmoid() 
         )
         
@@ -66,6 +58,7 @@ class CollisionPredictor(nn.Module):
 
 def train():
     # 설정
+    # 아까 cloth.py에서 저장한 폴더명으로 수정했네 (v2)
     DATA_DIR = "../dataset_curtain_128" 
     
     BATCH_SIZE = 1 
