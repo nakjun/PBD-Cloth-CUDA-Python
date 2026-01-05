@@ -23,6 +23,7 @@ from cloth_cuda_optimized import compute_features_kernel, solve_self_collision_m
 from PBD.module import predict_position_kernel, update_velocity_kernel, compute_hash_kernel, find_cell_start_end_kernel
 from PBD.coloring import compute_graph_coloring
 from PBD.module import solve_distance_constraint_colored_kernel 
+from MLP.transfer import CollisionPredictor
 
 # ------------------------------------------------------------------------------
 # Helper Function: OBJ Save with Heatmap
@@ -32,9 +33,9 @@ def save_obj_with_heatmap(filename, vertices, penetrations, width, height, thick
     [Heatmap Visualization]
     thickness: 시뮬레이션에서 사용된 파티클의 반지름 (self.thickness)
     """
-    diameter = thickness * 2.0
+    diameter = thickness * 1.5
     ignore_threshold = diameter * 0.05 
-    critical_threshold = diameter * 0.3 
+    critical_threshold = diameter * 0.3
 
     with open(filename, 'w') as f:
         f.write("# Cloth Simulation Step with Calibrated Heatmap\n")
@@ -73,8 +74,8 @@ class PowerfulClothSim:
         self.spacing = spacing
         
         # 물리 파라미터
-        self.dt = 0.001
-        self.substeps = 10 
+        self.dt = 0.005
+        self.substeps = 10
         self.gravity = -9.8
 
         lift_height = 3.0 # 3미터 상공에서 시작
@@ -82,33 +83,50 @@ class PowerfulClothSim:
         print(f"⚡ Initializing PowerfulClothSim ({width}x{height})")
         print(f"   - Particles: {self.num_particles}")
 
-        # 1. Host Data Setup
+        # 1. Host Data Setup (Y 동일, X/Z spacing에 따라 생성)
         pos_host = np.zeros((self.num_particles, 3), dtype=np.float32)
-        # [핵심 설정]
-        start_y = 1.5 # 바닥에서 1미터 정도 띄움 (너무 높으면 떨어지다 펴짐)
         
-        # 주름 파라미터 (Stacking을 유도하는 가이드)
-        fold_frequency = 10.0 # 주름의 빈도 (높을수록 자잘하게 접힘)
-        fold_amplitude = spacing * 0.5 # 주름의 깊이 (너무 깊으면 이미 접힌 상태)
+        # [핵심 수정 1] 각도 범위 조절 (0.5 PI = 90도)
+        # 180도(PI)는 너무 깊어서 말리기 쉬우므로, 90도 정도로 완만하게 폅니다.
+        arc_angle = math.pi * 0.7 
+        
+        # 호의 길이(Arc Length) = 천의 가로 길이
+        total_arc_length = width * spacing
+        
+        # 반지름 r = L / theta
+        radius = total_arc_length / arc_angle 
+        
+        center_y = 2.5 # 공중 높이
+        # X축 중앙 정렬을 위한 오프셋
+        center_x = (width * spacing) / 2.0 
+
+        # 각도의 시작점 (90도 범위를 중앙 정렬: 45도 ~ 135도)
+        # 270도(1.5 PI)가 원의 최하단이므로, 이를 기준으로 좌우로 벌림
+        start_angle = 1.5 * math.pi - (arc_angle / 2.0)
 
         for y in range(height):
             for x in range(width):
                 idx = y * width + x
                 
-                # X축: 정간격 배치
-                pos_x = x * spacing
+                # Z축: 길이 방향 (깊이)
+                pos_z = y * spacing
                 
-                # Y축: 수직으로 배치하되, 공중에 띄움
-                # (height가 클수록 위로 길게 뻗음)
-                pos_y = (height * spacing) - (y * spacing) + start_y
+                # X 비율 (0.0 ~ 1.0)
+                ratio = x / (width - 1)
                 
-                # [핵심] Z축: Y 높이에 따라 Sine Wave를 줌
-                # 이것이 "접히는 방향"을 결정함 (지그-재그 유도)
-                # y가 변함에 따라 z가 앞뒤로 흔들림
-                pos_z = math.sin(y * 0.5) * fold_amplitude
+                # 각도 계산 (Start ~ End)
+                theta = start_angle + ratio * arc_angle
                 
-                # (옵션) 약간 기울여서 떨어뜨리면 더 자연스러움 (Random Tilt)
-                # pos_z += y * 0.01 
+                # 극좌표 변환
+                # center_x는 전체적인 위치를 중앙으로 옮기기 위함
+                # (단순화: 반지름만큼 X, Y 변환 후 오프셋 적용)
+                
+                # cos(270) = 0, 이 근처를 사용
+                pos_x = center_x + radius * math.cos(theta)
+                pos_y = center_y + radius * math.sin(theta) # 270도 근처라 sin은 -1 (아래쪽)
+                
+                # 높이 보정 (가장 낮은 점이 center_y가 되도록 위로 살짝 올림)
+                pos_y += radius 
                 
                 pos_host[idx] = [pos_x, pos_y, pos_z]
         
@@ -161,22 +179,74 @@ class PowerfulClothSim:
         #         ]
 
         # [수정] 제약 조건 생성 (Structural + Shear)
+        # constraints = []
+        # for y in range(height):
+        #     for x in range(width):
+        #         idx = y * width + x
+                
+        #         # 1. Structural (가로/세로) - 기존
+        #         if x < width - 1: 
+        #             constraints.append([idx, idx + 1])
+        #         if y < height - 1: 
+        #             constraints.append([idx, idx + width])
+                
+        #         # 2. Shear (대각선) - [NEW] 추가!
+        #         # 천의 뒤틀림을 막아주어 형태를 유지함
+        #         if x < width - 1 and y < height - 1:
+        #             constraints.append([idx, idx + width + 1])      # ↘ 대각선
+        #             constraints.append([idx + 1, idx + width])      # ↙ 대각선
+
         constraints = []
+        rest_lengths_list = []
+        
         for y in range(height):
             for x in range(width):
                 idx = y * width + x
                 
-                # 1. Structural (가로/세로) - 기존
+                # 현재 파티클의 위치 (numpy 연산을 위해 가져옴)
+                p1 = pos_host[idx]
+
+                # 1. Structural (가로)
                 if x < width - 1: 
-                    constraints.append([idx, idx + 1])
+                    idx_next = idx + 1
+                    p2 = pos_host[idx_next]
+                    
+                    constraints.append([idx, idx_next])
+                    # [수정] 상수(spacing) 대신 실제 거리 계산
+                    dist = np.linalg.norm(p1 - p2)
+                    rest_lengths_list.append(dist)
+
+                # 2. Structural (세로)
                 if y < height - 1: 
-                    constraints.append([idx, idx + width])
+                    idx_next = idx + width
+                    p2 = pos_host[idx_next]
+                    
+                    constraints.append([idx, idx_next])
+                    # [수정] 실제 거리 계산
+                    dist = np.linalg.norm(p1 - p2)
+                    rest_lengths_list.append(dist)
                 
-                # 2. Shear (대각선) - [NEW] 추가!
-                # 천의 뒤틀림을 막아주어 형태를 유지함
+                # 3. Shear (대각선)
                 if x < width - 1 and y < height - 1:
-                    constraints.append([idx, idx + width + 1])      # ↘ 대각선
-                    constraints.append([idx + 1, idx + width])      # ↙ 대각선
+                    # ↘ 대각선
+                    idx_next = idx + width + 1
+                    p2 = pos_host[idx_next]
+                    constraints.append([idx, idx_next])
+                    rest_lengths_list.append(np.linalg.norm(p1 - p2)) # 실제 거리
+
+                    # ↙ 대각선
+                    idx_next_2 = idx + 1
+                    idx_next_3 = idx + width
+                    
+                    # (Note: 인덱싱 주의)
+                    # p_bl = (x, y+1) -> idx + width
+                    # p_tr = (x+1, y) -> idx + 1
+                    
+                    p_bl = pos_host[idx + width]
+                    p_tr = pos_host[idx + 1]
+                    
+                    constraints.append([idx + 1, idx + width])
+                    rest_lengths_list.append(np.linalg.norm(p_tr - p_bl)) # 실제 거리
         
         
         # # 제약 조건 생성
@@ -197,16 +267,16 @@ class PowerfulClothSim:
         # Rest Lengths
         constraints = np.array(constraints, dtype=np.int32)
         # rest_lengths = np.full(self.num_constraints, spacing, dtype=np.float32)
-        rest_lengths_list = []
-        for y in range(height):
-            for x in range(width):
-                # Structural
-                if x < width - 1: rest_lengths_list.append(spacing)
-                if y < height - 1: rest_lengths_list.append(spacing)
-                # Shear
-                if x < width - 1 and y < height - 1:
-                    rest_lengths_list.append(spacing * math.sqrt(2)) # 대각선 길이
-                    rest_lengths_list.append(spacing * math.sqrt(2))
+        # rest_lengths_list = []
+        # for y in range(height):
+        #     for x in range(width):
+        #         # Structural
+        #         if x < width - 1: rest_lengths_list.append(spacing)
+        #         if y < height - 1: rest_lengths_list.append(spacing)
+        #         # Shear
+        #         if x < width - 1 and y < height - 1:
+        #             rest_lengths_list.append(spacing * math.sqrt(2)) # 대각선 길이
+        #             rest_lengths_list.append(spacing * math.sqrt(2))
 
         rest_lengths = np.array(rest_lengths_list, dtype=np.float32)
 
@@ -218,7 +288,7 @@ class PowerfulClothSim:
         self.d_rest_lengths = cuda.to_device(rest_lengths)
         
         mass_inv = np.ones(self.num_particles, dtype=np.float32)
-        mass_inv[0] = 0.0 
+        # mass_inv[width - 1] = 0.0 
         # mass_inv[width-1] = 0.0 
         self.d_mass_inv = cuda.to_device(mass_inv)
         
@@ -238,36 +308,32 @@ class PowerfulClothSim:
         
         # 4. AI & Zero-Copy Setup
         print(f"🧠 Loading AI Brain from {model_path}...")
-        
-        if os.path.exists(model_path):
-            self.ai_model = torch.nn.Sequential(
-                torch.nn.Linear(4, 32),
-                torch.nn.ReLU(),
-                torch.nn.Linear(32, 16),
-                torch.nn.ReLU(),
-                torch.nn.Linear(16, 1),
-                torch.nn.Sigmoid()
-            ).cuda()
-            
-            checkpoint = torch.load(model_path, map_location='cuda')
-            new_state_dict = {k.replace("net.", ""): v for k, v in checkpoint.items()}
-            self.ai_model.load_state_dict(new_state_dict, strict=False)
-            self.ai_model.eval()
-            
-            try:
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found at {model_path}!")
+
+        self.ai_model = CollisionPredictor().cuda()
+        self.ai_model.eval()
+
+        try:
+            import torch
+            # Check if we are on a platform that supports Triton/Inductor effectively
+            if hasattr(torch, "compile") and os.name != 'nt': # Skip on Windows ('nt') by default to be safe
                 self.ai_model = torch.compile(self.ai_model)
-                print("🚀 PyTorch 2.0 Compiled Model Activated!")
-            except:
-                pass
-        else:
-            raise FileNotFoundError("Model not found!")
+                print("🚀 PyTorch 2.x Compiled Model Activated!")
+            else:
+                print("⚠️ Skipping torch.compile (Windows or unsupported platform). Running in Eager mode.")
+        except Exception as e:
+            print(f"⚠️ torch.compile failed or not supported: {e}")
+            print("   -> Running in standard Eager mode (Safe).")
+            # Model will run in eager mode automatically if compile fails/skips
 
         self.d_features = cuda.device_array((self.num_particles, 4), dtype=np.float32)
         self.d_risk_mask = cuda.device_array(self.num_particles, dtype=np.float32)
-        
+
         self.frame_count = 0
-        self.ai_interval = 10 
-        
+        self.ai_interval = 10
+
         print("✅ Simulation Engine Ready. Let's Rock.")
 
     def _numba_to_torch(self, numba_array):
@@ -288,9 +354,16 @@ class PowerfulClothSim:
         with torch.no_grad():
             # (N, 4) -> Model -> (N, 1)
             probs = self.ai_model(input_tensor)
+
+            # [디버깅] AI가 예측한 확률의 통계 확인
+            # max_prob = probs.max().item()
+            # mean_prob = probs.mean().item()
+            # if self.frame_count % 10 == 0:
+            #     print(f"   🤖 AI Brain: Max Prob={max_prob:.4f} | Mean={mean_prob:.4f}")
+
             # Thresholding (0.5)
             # (N, 1) -> (N, )
-            mask_tensor = (probs > 0.5).float().squeeze()
+            mask_tensor = (probs > 0.1).float().squeeze()
             # 3. Write back to Numba Buffer [FIXED]
             # PyTorch Tensor -> Numba Wrapper 변환
             # (mask_tensor가 메모리상 연속적이지 않을 수 있으므로 contiguous() 호출 필수)
@@ -364,9 +437,8 @@ class PowerfulClothSim:
 
             solve_ground_collision_kernel[self.blocks, self.threads](
                 self.d_pos_pred, self.d_pos, self.d_vel, 
-                self.num_particles, 0.0, 0.5
+                self.num_particles, 0.0, 0.7
             )
-
             
             solve_self_collision_masked_kernel[self.blocks, self.threads](
                 self.d_pos_pred, self.d_mass_inv,
@@ -399,14 +471,17 @@ if __name__ == "__main__":
                         help="Mode 1: Single FPS Benchmark, Mode 2: Extract OBJ, Mode 3: Grid Search Benchmark")
     args = parser.parse_args()
 
+    SIZE = 128
+
     # 모델 경로
+    # MODEL_PATH = "../MLP/best_model_adapted.pth"
     MODEL_PATH = "../MLP/best_model_v2.pth"
 
     # [Type 3가 아닐 때만 기본 1024x1024 생성]
     # Grid Search 때는 해상도를 바꿔가며 생성해야 하므로 여기서는 생성하지 않거나, 생성 후 무시함.
     if args.type != 3:
         # 1. 초기화 (기본)
-        sim = PowerfulClothSim(128, 128, MODEL_PATH, spacing=0.1)
+        sim = PowerfulClothSim(SIZE, SIZE, MODEL_PATH, spacing=0.1)
         print("🔥 Warming up GPU...")
         for _ in range(10): sim.step()
         torch.cuda.synchronize()
@@ -447,10 +522,10 @@ if __name__ == "__main__":
     elif args.type == 2:
         print("\n[MODE 2] Extracting OBJ files with Heatmap...")
         
-        output_dir = "extracted_objs_baseline_v3"
+        output_dir = "extracted_objs_tunnel_v3"
         os.makedirs(output_dir, exist_ok=True)
         
-        TOTAL_FRAMES = 3000
+        TOTAL_FRAMES = 5000
         SAVE_INTERVAL = 10
         
         print(f"📂 Output Directory: {output_dir}")
