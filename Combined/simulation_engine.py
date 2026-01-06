@@ -6,6 +6,7 @@ import os
 import math
 import argparse
 import csv  # [NEW] CSV 저장을 위한 모듈
+from tqdm import tqdm
 
 # [User Imports] 자네가 정의한 경로 설정
 sys.path.append('../')
@@ -30,35 +31,56 @@ from MLP.transfer import CollisionPredictor
 # ------------------------------------------------------------------------------
 def save_obj_with_heatmap(filename, vertices, penetrations, width, height, thickness):
     """
-    [Heatmap Visualization]
-    thickness: 시뮬레이션에서 사용된 파티클의 반지름 (self.thickness)
+    [Upgrade] Heatmap Color + UV Coordinates (Texture Mapping)
     """
     diameter = thickness * 1.5
     ignore_threshold = diameter * 0.05 
     critical_threshold = diameter * 0.3
 
     with open(filename, 'w') as f:
-        f.write("# Cloth Simulation Step with Calibrated Heatmap\n")
+        f.write("# Powerful Cloth Sim with UVs\n")
+        
+        # 1. Vertices (v x y z r g b) - 히트맵 컬러 포함
         for i, v in enumerate(vertices):
             depth = penetrations[i]
             
             ratio = 0.0
-            if depth <= ignore_threshold:
-                ratio = 0.0
-            else:
+            if depth > ignore_threshold:
                 ratio = (depth - ignore_threshold) / (critical_threshold - ignore_threshold)
                 ratio = min(max(ratio, 0.0), 1.0)
             
-            r = 1.0
-            g = 1.0 - ratio
-            b = 1.0 - ratio
+            r, g, b = 1.0, 1.0 - ratio, 1.0 - ratio
+            # Blender는 OBJ의 Vertex Color를 지원함 (속성에서 확인 가능)
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {r:.4f} {g:.4f} {b:.4f}\n")
 
+        # 2. UV Coordinates (vt u v) - [NEW] 텍스처 좌표 생성
+        # 격자 형태이므로 0~1 사이 값으로 정규화하여 생성
+        for y in range(height):
+            for x in range(width):
+                u = x / (width - 1)
+                v = y / (height - 1)
+                f.write(f"vt {u:.4f} {v:.4f}\n")
+
+        # 3. Faces (f v1/vt1 v2/vt2 v3/vt3) - [NEW] 좌표 인덱스 연결
         for y in range(height - 1):
             for x in range(width - 1):
-                idx = y * width + x + 1
-                f.write(f"f {idx} {idx + width} {idx + 1}\n")
-                f.write(f"f {idx + 1} {idx + width} {idx + width + 1}\n")
+                # OBJ는 인덱스가 1부터 시작함
+                # 현재 버텍스 순서와 UV 순서가 동일하게 생성되었으므로 인덱스를 같이 씀
+                
+                # Quad를 두 개의 Triangle로 나눔
+                # (x, y), (x+1, y), (x, y+1), (x+1, y+1)
+                
+                idx_bl = (y * width + x) + 1       # Bottom-Left
+                idx_br = (y * width + x + 1) + 1   # Bottom-Right
+                idx_tl = ((y + 1) * width + x) + 1 # Top-Left
+                idx_tr = ((y + 1) * width + x + 1) + 1 # Top-Right
+                
+                # Triangle 1 (BL - BR - TR) -> 반시계 방향 주의
+                # f v/vt v/vt v/vt
+                f.write(f"f {idx_bl}/{idx_bl} {idx_br}/{idx_br} {idx_tr}/{idx_tr}\n")
+                
+                # Triangle 2 (BL - TR - TL)
+                f.write(f"f {idx_bl}/{idx_bl} {idx_tr}/{idx_tr} {idx_tl}/{idx_tl}\n")
 
 # ------------------------------------------------------------------------------
 # Class Definition
@@ -85,50 +107,69 @@ class PowerfulClothSim:
 
         # 1. Host Data Setup (Y 동일, X/Z spacing에 따라 생성)
         pos_host = np.zeros((self.num_particles, 3), dtype=np.float32)
-        
-        # [핵심 수정 1] 각도 범위 조절 (0.5 PI = 90도)
-        # 180도(PI)는 너무 깊어서 말리기 쉬우므로, 90도 정도로 완만하게 폅니다.
-        arc_angle = math.pi * 0.7 
-        
-        # 호의 길이(Arc Length) = 천의 가로 길이
-        total_arc_length = width * spacing
-        
-        # 반지름 r = L / theta
-        radius = total_arc_length / arc_angle 
-        
-        center_y = 2.5 # 공중 높이
-        # X축 중앙 정렬을 위한 오프셋
-        center_x = (width * spacing) / 2.0 
 
-        # 각도의 시작점 (90도 범위를 중앙 정렬: 45도 ~ 135도)
-        # 270도(1.5 PI)가 원의 최하단이므로, 이를 기준으로 좌우로 벌림
-        start_angle = 1.5 * math.pi - (arc_angle / 2.0)
+        # Flag 형태의 천을 생성합니다.
+        start_y = 2.0 # 높이 조금 Up (깃발 느낌)
+        flag_wave_amplitude = spacing * 0.6  # 파도 높이 (조절 가능)
+        flag_wave_frequency = 2.0            # 파도 빈도 (파장=늘릴수록 느리고 큼)
+        flag_offset = 0.0                    # y방향 오프셋
 
         for y in range(height):
             for x in range(width):
                 idx = y * width + x
-                
-                # Z축: 길이 방향 (깊이)
-                pos_z = y * spacing
-                
-                # X 비율 (0.0 ~ 1.0)
-                ratio = x / (width - 1)
-                
-                # 각도 계산 (Start ~ End)
-                theta = start_angle + ratio * arc_angle
-                
-                # 극좌표 변환
-                # center_x는 전체적인 위치를 중앙으로 옮기기 위함
-                # (단순화: 반지름만큼 X, Y 변환 후 오프셋 적용)
-                
-                # cos(270) = 0, 이 근처를 사용
-                pos_x = center_x + radius * math.cos(theta)
-                pos_y = center_y + radius * math.sin(theta) # 270도 근처라 sin은 -1 (아래쪽)
-                
-                # 높이 보정 (가장 낮은 점이 center_y가 되도록 위로 살짝 올림)
-                pos_y += radius 
-                
+
+                # 깃발은 X=0 쪽 (막대기)에서 시작해서 +X로 뻗음, Z방향으로 물결침
+                pos_x = x * spacing
+                pos_y = (height - y - 1) * spacing + start_y  # 맨 위가 start_y (축 방향 보정)
+                pos_z = math.sin(x * flag_wave_frequency * math.pi / width) * flag_wave_amplitude
+                # "날리는" 느낌 가미: 아래로 갈수록 파도 줄어듦
+                pos_z *= (1.0 - y / (height-1)) if height > 1 else 1.0
+
                 pos_host[idx] = [pos_x, pos_y, pos_z]
+        
+        # [핵심 수정 1] 각도 범위 조절 (0.5 PI = 90도)
+        # 180도(PI)는 너무 깊어서 말리기 쉬우므로, 90도 정도로 완만하게 폅니다.
+        # arc_angle = math.pi * 0.7 
+        
+        # # 호의 길이(Arc Length) = 천의 가로 길이
+        # total_arc_length = width * spacing
+        
+        # # 반지름 r = L / theta
+        # radius = total_arc_length / arc_angle 
+        
+        # center_y = 2.5 # 공중 높이
+        # # X축 중앙 정렬을 위한 오프셋
+        # center_x = (width * spacing) / 2.0 
+
+        # # 각도의 시작점 (90도 범위를 중앙 정렬: 45도 ~ 135도)
+        # # 270도(1.5 PI)가 원의 최하단이므로, 이를 기준으로 좌우로 벌림
+        # start_angle = 1.5 * math.pi - (arc_angle / 2.0)
+
+        # for y in range(height):
+        #     for x in range(width):
+        #         idx = y * width + x
+                
+        #         # Z축: 길이 방향 (깊이)
+        #         pos_z = y * spacing
+                
+        #         # X 비율 (0.0 ~ 1.0)
+        #         ratio = x / (width - 1)
+                
+        #         # 각도 계산 (Start ~ End)
+        #         theta = start_angle + ratio * arc_angle
+                
+        #         # 극좌표 변환
+        #         # center_x는 전체적인 위치를 중앙으로 옮기기 위함
+        #         # (단순화: 반지름만큼 X, Y 변환 후 오프셋 적용)
+                
+        #         # cos(270) = 0, 이 근처를 사용
+        #         pos_x = center_x + radius * math.cos(theta)
+        #         pos_y = center_y + radius * math.sin(theta) # 270도 근처라 sin은 -1 (아래쪽)
+                
+        #         # 높이 보정 (가장 낮은 점이 center_y가 되도록 위로 살짝 올림)
+        #         pos_y += radius 
+                
+        #         pos_host[idx] = [pos_x, pos_y, pos_z]
         
 
         # for y in range(height):
@@ -288,7 +329,7 @@ class PowerfulClothSim:
         self.d_rest_lengths = cuda.to_device(rest_lengths)
         
         mass_inv = np.ones(self.num_particles, dtype=np.float32)
-        # mass_inv[width - 1] = 0.0 
+        mass_inv[0] = 0.0 
         # mass_inv[width-1] = 0.0 
         self.d_mass_inv = cuda.to_device(mass_inv)
         
@@ -408,6 +449,12 @@ class PowerfulClothSim:
             self._run_ai_culling()
         
         self.frame_count += 1
+
+        if self.frame_count == 500:
+            mass_inv_host = self.d_mass_inv.copy_to_host()
+            mass_inv_host[0] = 1.0
+            self.dt = 0.01
+            self.d_mass_inv = cuda.to_device(mass_inv_host)
         
         # [Step 2] PBD Substeps
         for _ in range(self.substeps):
@@ -471,7 +518,7 @@ if __name__ == "__main__":
                         help="Mode 1: Single FPS Benchmark, Mode 2: Extract OBJ, Mode 3: Grid Search Benchmark")
     args = parser.parse_args()
 
-    SIZE = 128
+    SIZE = 1024
 
     # 모델 경로
     # MODEL_PATH = "../MLP/best_model_adapted.pth"
@@ -490,7 +537,7 @@ if __name__ == "__main__":
     # TYPE 1: Average FPS Benchmark (Single)
     # ==========================================
     if args.type == 1:
-        print("\n[MODE 1] Starting FPS Benchmark (1024x1024)...")
+        print(f"\n[MODE 1] Starting FPS Benchmark ({SIZE}*{SIZE})...")
         
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -499,8 +546,8 @@ if __name__ == "__main__":
         avg_active_ratio = 0.0
         
         print("⏱️  Profiling 100 frames...")
-        
-        for i in range(100):
+        TOTAL_FRAMES = 5000
+        for i in tqdm(range(TOTAL_FRAMES), desc="Profiling Frames"):
             start_event.record()
             sim.step()
             end_event.record()
@@ -522,7 +569,7 @@ if __name__ == "__main__":
     elif args.type == 2:
         print("\n[MODE 2] Extracting OBJ files with Heatmap...")
         
-        output_dir = "extracted_objs_tunnel_v3"
+        output_dir = "extracted_objs_flag_v1"
         os.makedirs(output_dir, exist_ok=True)
         
         TOTAL_FRAMES = 5000

@@ -7,36 +7,56 @@ from tqdm import tqdm
 # [기존 함수 유지] 색상(RGB)을 포함하여 OBJ 저장 & 침투 깊이 기반 보정
 def save_obj_with_heatmap(filename, vertices, penetrations, width, height, thickness):
     """
-    [수정된 버전]
-    thickness: 시뮬레이션에서 사용된 파티클의 반지름 (self.thickness)
+    [Upgrade] Heatmap Color + UV Coordinates (Texture Mapping)
     """
-    # 1. 기준값 설정 (Calibration)
-    diameter = thickness * 2.0
+    diameter = thickness * 1.5
     ignore_threshold = diameter * 0.05 
-    critical_threshold = diameter * 0.3 
+    critical_threshold = diameter * 0.3
 
     with open(filename, 'w') as f:
-        f.write("# Cloth Simulation Step with Calibrated Heatmap\n")
+        f.write("# Powerful Cloth Sim with UVs\n")
+        
+        # 1. Vertices (v x y z r g b) - 히트맵 컬러 포함
         for i, v in enumerate(vertices):
             depth = penetrations[i]
             
             ratio = 0.0
-            if depth <= ignore_threshold:
-                ratio = 0.0
-            else:
+            if depth > ignore_threshold:
                 ratio = (depth - ignore_threshold) / (critical_threshold - ignore_threshold)
                 ratio = min(max(ratio, 0.0), 1.0)
             
-            r = 1.0
-            g = 1.0 - ratio
-            b = 1.0 - ratio
+            r, g, b = 1.0, 1.0 - ratio, 1.0 - ratio
+            # Blender는 OBJ의 Vertex Color를 지원함 (속성에서 확인 가능)
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {r:.4f} {g:.4f} {b:.4f}\n")
 
+        # 2. UV Coordinates (vt u v) - [NEW] 텍스처 좌표 생성
+        # 격자 형태이므로 0~1 사이 값으로 정규화하여 생성
+        for y in range(height):
+            for x in range(width):
+                u = x / (width - 1)
+                v = y / (height - 1)
+                f.write(f"vt {u:.4f} {v:.4f}\n")
+
+        # 3. Faces (f v1/vt1 v2/vt2 v3/vt3) - [NEW] 좌표 인덱스 연결
         for y in range(height - 1):
             for x in range(width - 1):
-                idx = y * width + x + 1
-                f.write(f"f {idx} {idx + width} {idx + 1}\n")
-                f.write(f"f {idx + 1} {idx + width} {idx + width + 1}\n")
+                # OBJ는 인덱스가 1부터 시작함
+                # 현재 버텍스 순서와 UV 순서가 동일하게 생성되었으므로 인덱스를 같이 씀
+                
+                # Quad를 두 개의 Triangle로 나눔
+                # (x, y), (x+1, y), (x, y+1), (x+1, y+1)
+                
+                idx_bl = (y * width + x) + 1       # Bottom-Left
+                idx_br = (y * width + x + 1) + 1   # Bottom-Right
+                idx_tl = ((y + 1) * width + x) + 1 # Top-Left
+                idx_tr = ((y + 1) * width + x + 1) + 1 # Top-Right
+                
+                # Triangle 1 (BL - BR - TR) -> 반시계 방향 주의
+                # f v/vt v/vt v/vt
+                f.write(f"f {idx_bl}/{idx_bl} {idx_br}/{idx_br} {idx_tr}/{idx_tr}\n")
+                
+                # Triangle 2 (BL - TR - TL)
+                f.write(f"f {idx_bl}/{idx_bl} {idx_tr}/{idx_tr} {idx_tl}/{idx_tl}\n")
 
 def main_data_collection():
     print("🎓 Initialize Simulation for Ground Truth Collection...")

@@ -7,4 +7,4 @@ venv
 *.vrew
 *.mkv
 *.npz
-dataset_*
+dataset_*/
