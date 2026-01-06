@@ -555,7 +555,7 @@ if __name__ == "__main__":
             
             frame_time = start_event.elapsed_time(end_event)
             total_time_sum += frame_time
-            
+
         avg_fps = 1000.0 / (total_time_sum / 100)
         print("="*40)
         print(f"🚀 Final Result:")
