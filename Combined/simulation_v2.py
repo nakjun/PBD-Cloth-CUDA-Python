@@ -378,10 +378,10 @@ if __name__ == "__main__":
     sim = PowerfulClothSim(128, 128, MODEL_PATH, spacing=0.1)
     
     # 2. Run
-    OUTPUT_DIR = "extracted_objs_stable_v1"
+    OUTPUT_DIR = "extracted_objs_stable_v2"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    TOTAL_FRAMES = 4000
+    TOTAL_FRAMES = 5000
     
     print(f"🚀 Running Simulation... Saving to {OUTPUT_DIR}")
     
