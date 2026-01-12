@@ -22,4 +22,4 @@ python .\simulation_engine.py --type 3
 ![workflow](./workflow.jpg)
 
 ## Simulation Results
-![simulation_results](./simulation_results.gif)
+![simulation_results](./xbpd_wind.gif)
