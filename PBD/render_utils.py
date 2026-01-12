@@ -9,17 +9,26 @@ class ClothRenderer:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
 
-        # Topology 캐싱
+        # 1. Topology 캐싱 (Cloth)
         self.faces = self._create_grid_topology(width, height)
         
-        # Plotter 초기화
+        # 2. 바닥(Floor) 미리 생성 [NEW]
+        # 중심(0,0,0), Y축(0,1,0)을 바라보는 평면, 크기 30x30
+        self.floor_mesh = pv.Plane(center=(0, -0.001, 0), direction=(0, 1, 0), i_size=50, j_size=50)
+        # 텍스처 매핑을 위해 UV 좌표 생성
+        self.floor_mesh.texture_map_to_plane(inplace=True) 
+        
+        # 3. 체크보드 텍스처 생성 [NEW]
+        self.floor_texture = self._create_checkerboard_texture()
+
+        # 4. Plotter 초기화
         self.plotter = pv.Plotter(off_screen=True, window_size=(1600, 1600))
         
-        # [중요] 조명 설정 보강 (입체감을 위해)
-        self.plotter.enable_eye_dome_lighting()  # SSAO와 유사한 효과
-        self.plotter.add_light(pv.Light(position=(0, 10, 10), intensity=0.8)) # 상단 조명
+        # 조명 설정
+        self.plotter.enable_eye_dome_lighting() 
+        self.plotter.add_light(pv.Light(position=(0, 10, 10), intensity=0.8)) 
 
-        # 카메라가 초기화되었는지 확인하는 플래그
+        # 카메라 플래그
         self.camera_set = False
 
     def _create_grid_topology(self, w, h):
@@ -27,42 +36,77 @@ class ClothRenderer:
         for y in range(h - 1):
             for x in range(w - 1):
                 idx = y * w + x
-                # Triangle 1 & 2
                 faces.append([3, idx, idx + 1, idx + w + 1])
                 faces.append([3, idx, idx + w + 1, idx + w])
         return np.hstack(faces)
 
-    def render_frame(self, positions, scalar_data=None, frame_idx=0, mode="analysis"):
+    def _create_checkerboard_texture(self):
+        """
+        [NEW] Numpy를 이용해 체크보드 텍스처 이미지를 생성합니다.
+        외부 이미지 파일 없이 코드로 패턴을 만듭니다.
+        """
+        # 8x8 패턴 생성
+        pattern_size = 8 
+        # 밝은 회색 / 어두운 회색 교차 (너무 흑백이면 눈 아픔)
+        color1 = [0.8, 0.8, 0.8] # Light Gray
+        color2 = [0.4, 0.4, 0.4] # Dark Gray
+        
+        # 텍스처 데이터 생성 (H, W, 3)
+        # 간단히 0과 1이 교차하는 마스크를 만듦
+        check = np.indices((pattern_size, pattern_size)).sum(axis=0) % 2
+        
+        # 마스크에 따라 색상 할당
+        texture_data = np.zeros((pattern_size, pattern_size, 3))
+        texture_data[check == 0] = color1
+        texture_data[check == 1] = color2
+        
+        # PyVista 텍스처 객체로 변환
+        # interpolate=False로 해야 픽셀이 뭉개지지 않고 선명한 체크무늬가 나옴
+        return pv.Texture(texture_data, interpolate=False)
+
+    def render_frame(self, positions, scalar_data=None, frame_idx=0, mode="analysis", sphere_params=None):
         """
         mode: 
-          - "analysis": 히트맵(Scalar) 시각화 (기존 방식)
-          - "visual": 실제 천 같은 단색 렌더링
+          - "analysis": 히트맵 시각화
+          - "visual": 단색 렌더링
         """
         self.plotter.clear()
         
-        # 1. Mesh 생성
+        # ---------------------------------------------------------
+        # 1. 바닥(Floor) 렌더링 [NEW]
+        # ---------------------------------------------------------
+        self.plotter.add_mesh(
+            self.floor_mesh, 
+            texture=self.floor_texture, # 체크보드 텍스처 적용
+            show_edges=False,
+            scalars=None,
+            lighting=True,
+            specular=0.1 # 약간의 반사광
+        )
+
+        # ---------------------------------------------------------
+        # 2. 구체(Sphere) 렌더링
+        # ---------------------------------------------------------
+        if sphere_params is not None:
+            center = sphere_params[:3]
+            radius = sphere_params[3]
+            sphere_mesh = pv.Sphere(radius=radius, center=center, phi_resolution=60, theta_resolution=60)
+            
+            self.plotter.add_mesh(
+                sphere_mesh,
+                color="orange",
+                opacity=1.0,
+                smooth_shading=True,
+                specular=0.5,
+                show_edges=False
+            )
+
+        # ---------------------------------------------------------
+        # 3. 천(Cloth) 렌더링
+        # ---------------------------------------------------------
         mesh = pv.PolyData(positions, self.faces)
         
-        # [핵심] 카메라 자동 세팅 (첫 프레임 기준)
-        if not self.camera_set:
-            # 메쉬의 정중앙(center)과 크기(length)를 구함
-            center = mesh.center
-            length = mesh.length # 대각선 길이
-            
-            # 카메라 위치: 중앙에서 약간 위쪽, 앞쪽으로 떨어트림
-            # 숫자는 '배율'이므로 해상도와 무관하게 작동함
-            cam_pos = (center[0], center[1] + length * 0.6, center[2] + length * 1.5)
-            
-            self.plotter.camera_position = [
-                cam_pos,    # Camera Position
-                center,     # Focal Point (메쉬 중앙을 바라봄)
-                (0, 1, 0)   # Up Vector
-            ]
-            self.camera_set = True  # 이후 프레임부터는 카메라 고정 (흔들림 방지)
-
-        # 2. 모드에 따른 렌더링 설정
         if mode == "analysis" and scalar_data is not None:
-            # 분석 모드: 히트맵 사용
             mesh.point_data["values"] = scalar_data
             self.plotter.add_mesh(
                 mesh, 
@@ -71,21 +115,38 @@ class ClothRenderer:
                 clim=[0, 0.05], 
                 show_edges=False,
                 smooth_shading=True,
-                specular=0.1  # 약간의 반사광
+                specular=0.25
             )
         else:
-            # 비주얼 모드: 단색 천 (예: 아이보리 색)
             self.plotter.add_mesh(
                 mesh, 
-                color="gainsboro",  # or 'light_blue', 'white'
-                show_edges=False,   # 와이어프레임 끄기
+                color="gainsboro",  
+                show_edges=False,   
                 smooth_shading=True,
-                specular=0.3,       # 실크 느낌을 위한 스펙큘러
+                specular=0.3,       
                 specular_power=15
             )
 
-        # 3. 텍스트 및 저장
-        # self.plotter.add_text(f"Mode: {mode} | Frame {frame_idx:04d}", font_size=10, color="black")
-        
+        # ---------------------------------------------------------
+        # 4. 카메라 및 저장
+        # ---------------------------------------------------------
+        if not self.camera_set:
+            center = mesh.center
+            length = mesh.length 
+            
+            if sphere_params is not None:
+                # 구체가 있으면 뷰를 좀 더 넓게 잡음
+                length = max(length, sphere_params[3] * 4.0)
+
+            # 바닥이 있으니 카메라는 살짝 위에서 넓게 보는 게 좋음
+            cam_pos = (center[0], center[1] + length * 0.8, center[2] + length * 2.0)
+            
+            self.plotter.camera_position = [
+                cam_pos,    # Pos
+                center,     # Focal
+                (0, 1, 0)   # Up
+            ]
+            self.camera_set = True
+
         filename = os.path.join(self.save_dir, f"frame_{frame_idx:04d}.png")
         self.plotter.screenshot(filename)
