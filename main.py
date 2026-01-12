@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 from Cloth.cloth import ClothSimulator
+from PBD.render_utils import ClothRenderer
 from tqdm import tqdm
 
 # [기존 함수 유지] 색상(RGB)을 포함하여 OBJ 저장 & 침투 깊이 기반 보정
@@ -69,11 +70,13 @@ def main_data_collection():
     os.makedirs(dataset_dir, exist_ok=True)
 
     # 2. 시각화 확인용 폴더 (OBJ)
-    vis_dir = "output_flag"
+    vis_dir = "test_3"
     os.makedirs(vis_dir, exist_ok=True)
 
-    total_frames = 2000 # 충분한 데이터 확보를 위해 2000 프레임 권장
+    total_frames = 1500 # 충분한 데이터 확보를 위해 2000 프레임 권장
     print(f"Start simulation for {total_frames} frames...")
+
+    renderer = ClothRenderer(width, height, save_dir="xpbd_wind")
 
     for frame in tqdm(range(total_frames), desc="Collecting Data"):
         sim.step()
@@ -94,29 +97,35 @@ def main_data_collection():
         # 기하학적 특성 추출
         geo_feature = sim.get_compression_feature(pos) # (N, 1)
 
-        # ---------------------------------------------------------
-        # [A] AI 학습용 데이터 저장 (.npz) - 매 프레임 저장 권장
-        # ---------------------------------------------------------
-        # 움직임의 연속성을 학습하려면 매 프레임 저장하는 것이 좋습니다.
-        save_path = os.path.join(dataset_dir, f"data_{frame:04d}.npz")
+        # # ---------------------------------------------------------
+        # # [A] AI 학습용 데이터 저장 (.npz) - 매 프레임 저장 권장
+        # # ---------------------------------------------------------
+        # # 움직임의 연속성을 학습하려면 매 프레임 저장하는 것이 좋습니다.
+        # save_path = os.path.join(dataset_dir, f"data_{frame:04d}.npz")
         
-        np.savez_compressed(
-            save_path,
-            pos=pos,    # 나중에 곡률(Curvature) 계산용
-            vel=vel,    # 입력 피처 (속도가 빠르면 충돌 위험 Up)
-            geo=geo_feature, # 기하학적 특성
-            label=penetration # 정답 (0보다 크면 충돌 지역)
-        )
+        # np.savez_compressed(
+        #     save_path,
+        #     pos=pos,    # 나중에 곡률(Curvature) 계산용
+        #     vel=vel,    # 입력 피처 (속도가 빠르면 충돌 위험 Up)
+        #     geo=geo_feature, # 기하학적 특성
+        #     label=penetration # 정답 (0보다 크면 충돌 지역)
+        # )
         # ---------------------------------------------------------
         # [B] 시각화용 OBJ 저장 (10프레임마다) - 눈으로 확인용
         # ---------------------------------------------------------
         if frame % 10 == 0:
-            save_obj_with_heatmap(
-                f"{vis_dir}/cloth_{frame:03d}.obj",
-                pos,
-                penetration,
-                width, height,
-                sim.thickness
+            # save_obj_with_heatmap(
+            #     f"{vis_dir}/cloth_{frame:03d}.obj",
+            #     pos,
+            #     penetration,
+            #     width, height,
+            #     sim.thickness
+            # )
+            renderer.render_frame(
+                pos, 
+                vel, # 여기에 시각화하고 싶은 값을 넣게 (Strain, Velocity 등)
+                frame,
+                # mode='visual'
             )
 
     print(f"✅ Data Collection Finished! Saved to {dataset_dir}/")

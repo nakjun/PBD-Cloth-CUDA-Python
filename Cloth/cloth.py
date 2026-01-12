@@ -1,8 +1,9 @@
+import torch
 import numpy as np
 from numba import cuda
 from PBD.module import predict_position_kernel, update_velocity_kernel
 from PBD.module import solve_distance_constraint_colored_kernel
-from PBD.module import compute_hash_kernel, find_cell_start_end_kernel, solve_self_collision_kernel
+from PBD.module import compute_hash_kernel, find_cell_start_end_kernel, solve_self_collision_friction_kernel, apply_aerodynamics_kernel
 from PBD.coloring import compute_graph_coloring
 import math
 
@@ -153,73 +154,155 @@ class ClothSimulator:
         # Penetration Depth 버퍼
         self.d_penetration = cuda.device_array(self.num_particles, dtype=np.float32)
 
+        faces_list = []
+        for y in range(height - 1):
+            for x in range(width - 1):
+                idx = y * width + x
+                # Triangle 1: (idx, idx+1, idx+width+1)
+                # Triangle 2: (idx, idx+width+1, idx+width)
+                # 주의: 렌더링용과 다르게 '3' 같은 헤더 없이 순수 인덱스만 저장
+                faces_list.append([idx, idx + 1, idx + width + 1])
+                faces_list.append([idx, idx + width + 1, idx + width])
+
+        faces_array = np.array(faces_list, dtype=np.int32)
+        self.num_faces = len(faces_array)
+        self.d_faces = cuda.to_device(faces_array) # GPU 업로드
+
+        # 2. 공기 역학 파라미터 정의
+        self.rho = 1.225            # 공기 밀도 (kg/m^3)
+        self.drag_coeff = 2.5       # 항력 계수 (Drag) - 바람에 밀리는 힘
+        self.lift_coeff = 0.5       # 양력 계수 (Lift) - 뜨는 힘
+        self.wind_vel = cuda.to_device(np.array([0.0, 0.0, 8.0], dtype=np.float32)) # Z방향 강풍
+
+    def _sort_particles_torch(self):
+        """
+        [Professor's Refinement] PyTorch를 이용한 고속 정렬
+        Numba Device Array <-> PyTorch Tensor 간의 Zero-Copy 변환을 수행합니다.
+        """
+        # 1. Numba -> PyTorch (Zero-Copy View 생성)
+        # __cuda_array_interface__를 통해 GPU 메모리 주소를 공유합니다.
+        ctx = cuda.current_context()
+        
+        # Numba 배열의 포인터를 PyTorch가 이해하도록 변환
+        hashes_torch = torch.as_tensor(self.d_particle_hashes, device='cuda')
+        indices_torch = torch.as_tensor(self.d_particle_indices, device='cuda')
+        
+        # 2. PyTorch의 강력한 Radix Sort 수행
+        # stable=True는 같은 해시값을 가진 파티클들의 순서를 유지해줌 (물리적 안정성에 도움)
+        sorted_indices = torch.argsort(hashes_torch, descending=False, stable=True)
+        
+        # 3. 정렬된 결과로 재배치 (Fancy Indexing - 여기서 VRAM 복사 발생)
+        # 하지만 C++ 레벨에서 최적화된 커널이 돌기 때문에 매우 빠름
+        hashes_sorted = hashes_torch[sorted_indices]
+        indices_sorted = indices_torch[sorted_indices]
+        
+        # 4. PyTorch -> Numba (데이터 덮어쓰기)
+        # PyTorch 텐서의 __cuda_array_interface__를 Numba가 읽어서 복사
+        # contiguous()는 메모리가 연속적인지 확인하는 안전장치
+        
+        # 방법 A: copy_to_device (명시적)
+        # self.d_particle_hashes.copy_to_device(cuda.as_cuda_array(hashes_sorted))
+        
+        # 방법 B: Direct Copy (추천)
+        # Numba device array에 다른 CUDA array 인터페이스 객체를 넣으면 D2D 복사가 일어남
+        
+        # [주의] PyTorch 텐서를 바로 Numba array에 할당할 수 없으므로,
+        # 아래와 같이 CUDA Interface를 통해 값을 복사해야 함.
+        
+        # 4-1. PyTorch Tensor -> Numba Device Array View
+        sorted_hashes_cuda = cuda.as_cuda_array(hashes_sorted)
+        sorted_indices_cuda = cuda.as_cuda_array(indices_sorted)
+        
+        # 4-2. 원본 버퍼에 복사 (Device to Device Copy)
+        self.d_particle_hashes.copy_to_device(sorted_hashes_cuda)
+        self.d_particle_indices.copy_to_device(sorted_indices_cuda)
+
     def step(self):
+
+        # compliance = 0.0       # 완전 딱딱함 (비신축성, 실크/면)
+        # compliance = 0.00001   # 아주 약간 늘어남 (나일론)
+        # compliance = 0.005     # 고무줄/스판덱스
+        target_compliance = 0.0000001 # 거의 0에 가깝게 설정하여 기존 천 느낌 유지
 
         dt_sub = self.dt / self.substeps
 
         for _ in range(self.substeps):
-
-            # 1. Predict (기존)
-            predict_position_kernel[self.blocks_particles, self.threads_per_block](
-                self.d_pos, self.d_vel, self.d_pos_pred, self.d_mass_inv, dt_sub, -9.8, self.num_particles
+                
+            # ------------------------------------------------------------------
+            # [Stage 0] External Forces (Aerodynamics)
+            # ------------------------------------------------------------------
+            # 바람에 의한 양력/항력을 계산하여 현재 속도(vel)에 선반영
+            blocks_faces = (self.num_faces + self.threads_per_block - 1) // self.threads_per_block
+            
+            apply_aerodynamics_kernel[blocks_faces, self.threads_per_block](
+                self.d_pos,         # Position (for Normal calc)
+                self.d_vel,         # Velocity (Force applied here)
+                self.d_faces,       # Topology
+                self.wind_vel,      # Wind Vector
+                self.rho,           # Air Density
+                self.drag_coeff,    # Cd
+                self.lift_coeff,    # Cl
+                dt_sub,             # Time step
+                self.num_faces
             )
 
+            # ------------------------------------------------------------------
+            # [Stage 1] Prediction & Integration
+            # ------------------------------------------------------------------
+            # 중력 적용 및 위치 예측 (Explicit Integration)
+            predict_position_kernel[self.blocks_particles, self.threads_per_block](
+                self.d_pos, self.d_vel, self.d_pos_pred, self.d_mass_inv, 
+                dt_sub, -9.8, self.num_particles
+            )
 
-            # 2. Graph Coloring Constraints (기존)
-            # Color 0 실행 -> 동기화 -> Color 1 실행 -> 동기화 ...
-            # k_stiffness = 1.0 (이제 1.0을 넣어도 폭발하지 않음!)
+            # ------------------------------------------------------------------
+            # [Stage 2] Distance Constraints (XPBD + Graph Coloring)
+            # ------------------------------------------------------------------
+            # Graph Coloring으로 병렬화된 거리 제약 조건 해결
             for d_batch in self.d_color_batches:
-                threads = 256
-                blocks = (d_batch.shape[0] + threads - 1) // threads
+                blocks_batch = (d_batch.shape[0] + self.threads_per_block - 1) // self.threads_per_block
 
-                solve_distance_constraint_colored_kernel[blocks, threads](
+                solve_distance_constraint_colored_kernel[blocks_batch, self.threads_per_block](
                     self.d_pos_pred, self.d_mass_inv, self.d_constraints, self.d_rest_lengths,
-                    d_batch, dt_sub, 1.0
+                    d_batch, dt_sub, target_compliance
                 )
-                # CUDA 커널 런칭은 기본적으로 비동기지만, 스트림이 같으면 순차 실행됨.
-                # 필요하다면 cuda.synchronize()를 넣어도 됨.
 
-            self.d_penetration[:] = 0.0 # 초기화
-            
-
-            # [NEW] 3. Self-Collision (Spatial Hashing)
-            # 3-1. Reset Cell Info
-            self.d_cell_start[:] = -1 # -1로 초기화 (비어있음)
+            # ------------------------------------------------------------------
+            # [Stage 3] Self-Collision (Spatial Hashing)
+            # ------------------------------------------------------------------
+            # 3-1. Reset Grid
+            self.d_cell_start[:] = -1 
             self.d_cell_end[:] = -1
+            self.d_penetration[:] = 0.0
 
             # 3-2. Compute Hash
             compute_hash_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_pos_pred, self.d_particle_hashes, self.d_particle_indices, self.num_particles
             )
 
-            # 3-3. Sort (CPU로 가져와서 정렬 - Prototype용 타협)
-            # *주의*: 고성능을 위해선 Thrust나 CuPy의 argsort를 써야 함.
-            # 지금은 로직 검증용이라 numpy로 함.
-            hashes = self.d_particle_hashes.copy_to_host()
-            indices = self.d_particle_indices.copy_to_host()
-
-            sort_order = np.argsort(hashes)
-            sorted_hashes = hashes[sort_order]
-            sorted_indices = indices[sort_order]
-
-            # 다시 GPU로 업로드
-            self.d_particle_hashes = cuda.to_device(sorted_hashes)
-            self.d_particle_indices = cuda.to_device(sorted_indices)
+            # 3-3. Sort Particles (PyTorch Radix Sort - Zero Copy)
+            self._sort_particles_torch()
 
             # 3-4. Find Cell Bounds
             find_cell_start_end_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_particle_hashes, self.d_cell_start, self.d_cell_end, self.num_particles
             )
 
-            # 3-5. Solve Self Collision
-            solve_self_collision_kernel[self.blocks_particles, self.threads_per_block](
-                self.d_pos_pred, self.d_mass_inv, 
+            # 3-5. Solve Collision with Friction
+            solve_self_collision_friction_kernel[self.blocks_particles, self.threads_per_block](
+                self.d_pos_pred,        # Candidate Position
+                self.d_pos,             # Previous Position (for relative velocity)
+                self.d_mass_inv, 
                 self.d_cell_start, self.d_cell_end, 
                 self.d_particle_indices, self.d_particle_hashes, 
-                self.num_particles, self.thickness, self.d_penetration
+                self.num_particles, self.thickness, self.d_penetration,
+                dt_sub
             )
 
-            # 4. Update Velocity (기존)
+            # ------------------------------------------------------------------
+            # [Stage 4] Velocity Update
+            # ------------------------------------------------------------------
+            # 위치 확정 및 속도 갱신 (Damping 포함)
             update_velocity_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_pos, self.d_vel, self.d_pos_pred, dt_sub, self.num_particles
             )

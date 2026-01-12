@@ -8,3 +8,5 @@ venv
 *.mkv
 *.npz
 dataset_*/
+test*
+xpbd*
