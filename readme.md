@@ -1,4 +1,4 @@
-# Efficient Cloth Simulation with MLP-based Self-collision Masking Method
+# Efficient Self-collision for Real-Time Cloth Simulation
 
 ## Setting
 ```
@@ -9,6 +9,9 @@ pip install -r requirements.txt # venv 생성 후 설치 추천 / torch의 CUDA 
 python main.py # 시뮬레이션 수행
 python make_gif.py # 시뮬레이션 결과 gif로 저장
 ```
+
+## Workflow
+![workflow](./workflow_v2.jpg)
 
 ## Simulation Results
 ![simulation_results](./results.gif)
