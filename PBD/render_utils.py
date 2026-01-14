@@ -12,13 +12,17 @@ class ClothRenderer:
         # 1. Topology 캐싱 (Cloth)
         self.faces = self._create_grid_topology(width, height)
         
-        # 2. 바닥(Floor) 미리 생성 [NEW]
-        # 중심(0,0,0), Y축(0,1,0)을 바라보는 평면, 크기 30x30
-        self.floor_mesh = pv.Plane(center=(0, -0.001, 0), direction=(0, 1, 0), i_size=50, j_size=50)
+        # 2. 바닥(Floor) 미리 생성
+        # 중심(0,0,0), Y축(0,1,0)을 바라보는 평면
+        self.floor_mesh = pv.Plane(center=(0, -0.001, 0), direction=(0, 1, 0), i_size=250, j_size=250)
+        
+        # [핵심 수정 1] 기존 데이터 초기화 (이걸 안 하면 빨강/파랑 히트맵이 나옴)
+        self.floor_mesh.clear_data() 
+        
         # 텍스처 매핑을 위해 UV 좌표 생성
         self.floor_mesh.texture_map_to_plane(inplace=True) 
         
-        # 3. 체크보드 텍스처 생성 [NEW]
+        # 3. 체크보드 텍스처 생성 (회색/흰색)
         self.floor_texture = self._create_checkerboard_texture()
 
         # 4. Plotter 초기화
@@ -42,26 +46,26 @@ class ClothRenderer:
 
     def _create_checkerboard_texture(self):
         """
-        [NEW] Numpy를 이용해 체크보드 텍스처 이미지를 생성합니다.
-        외부 이미지 파일 없이 코드로 패턴을 만듭니다.
+        [핵심 수정 2] float(0.0~1.0) 대신 uint8(0~255)을 사용하여
+        PyVista가 색상 데이터임을 명확히 인식하게 함 (흰색/회색)
         """
-        # 8x8 패턴 생성
-        pattern_size = 8 
-        # 밝은 회색 / 어두운 회색 교차 (너무 흑백이면 눈 아픔)
-        color1 = [0.8, 0.8, 0.8] # Light Gray
-        color2 = [0.4, 0.4, 0.4] # Dark Gray
+        pattern_size = 32
         
-        # 텍스처 데이터 생성 (H, W, 3)
-        # 간단히 0과 1이 교차하는 마스크를 만듦
+        # 색상 정의 (0~255 정수 사용)
+        # 흰색
+        color1 = np.array([255, 255, 255], dtype=np.uint8) 
+        # 회색 (밝은 회색)
+        color2 = np.array([180, 180, 180], dtype=np.uint8) 
+        
+        # 체크 패턴 마스크 생성
         check = np.indices((pattern_size, pattern_size)).sum(axis=0) % 2
         
-        # 마스크에 따라 색상 할당
-        texture_data = np.zeros((pattern_size, pattern_size, 3))
+        # 텍스처 데이터 배열 생성 (uint8 타입)
+        texture_data = np.zeros((pattern_size, pattern_size, 3), dtype=np.uint8)
         texture_data[check == 0] = color1
         texture_data[check == 1] = color2
         
-        # PyVista 텍스처 객체로 변환
-        # interpolate=False로 해야 픽셀이 뭉개지지 않고 선명한 체크무늬가 나옴
+        # interpolate=False: 픽셀이 뭉개지지 않고 선명한 체크무늬 유지
         return pv.Texture(texture_data, interpolate=False)
 
     def render_frame(self, positions, scalar_data=None, frame_idx=0, mode="analysis", sphere_params=None):
@@ -132,20 +136,15 @@ class ClothRenderer:
         # ---------------------------------------------------------
         if not self.camera_set:
             center = mesh.center
-            length = mesh.length 
-            
+            target = center
             if sphere_params is not None:
-                # 구체가 있으면 뷰를 좀 더 넓게 잡음
-                length = max(length, sphere_params[3] * 4.0)
+                target = sphere_params[:3]
 
-            # 바닥이 있으니 카메라는 살짝 위에서 넓게 보는 게 좋음
-            cam_pos = (center[0], center[1] + length * 0.8, center[2] + length * 2.0)
+            # 뷰 각도를 조금 낮춰서 더 웅장하게 (Low Angle)
+            cam_pos = (target[0] + 0.0, target[1] + 30, target[2] + 70.0)
             
-            self.plotter.camera_position = [
-                cam_pos,    # Pos
-                center,     # Focal
-                (0, 1, 0)   # Up
-            ]
+            self.plotter.camera_position = [cam_pos, target, (0, 1, 0)]
+            self.plotter.camera.zoom(1.3) 
             self.camera_set = True
 
         filename = os.path.join(self.save_dir, f"frame_{frame_idx:04d}.png")

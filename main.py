@@ -62,8 +62,8 @@ def save_obj_with_heatmap(filename, vertices, penetrations, width, height, thick
 def main_data_collection():
     print("🎓 Initialize Simulation for Ground Truth Collection...")
 
-    width, height = 128, 128    # Resolution (128x128 정도면 학습용으로 적절합니다)
-    sim = ClothSimulator(width, height, spacing=0.1)
+    SIZE = 256
+    sim = ClothSimulator(SIZE, SIZE, physical_width=12.0, dt=0.01, substeps=17)
 
     # 1. 학습 데이터셋 저장 폴더 (NPZ)
     dataset_dir = "dataset_flag_128"
@@ -73,10 +73,10 @@ def main_data_collection():
     vis_dir = "test_3"
     os.makedirs(vis_dir, exist_ok=True)
 
-    total_frames = 1500 # 충분한 데이터 확보를 위해 2000 프레임 권장
+    total_frames = 5000 # 충분한 데이터 확보를 위해 2000 프레임 권장
     print(f"Start simulation for {total_frames} frames...")
 
-    renderer = ClothRenderer(width, height, save_dir="xpbd_wind")
+    renderer = ClothRenderer(SIZE, SIZE, save_dir="xpbd_256_thick")
 
     for frame in tqdm(range(total_frames), desc="Collecting Data"):
         sim.step()
@@ -113,7 +113,7 @@ def main_data_collection():
         # ---------------------------------------------------------
         # [B] 시각화용 OBJ 저장 (10프레임마다) - 눈으로 확인용
         # ---------------------------------------------------------
-        if frame % 10 == 0:
+        if frame % 5 == 0:
             # save_obj_with_heatmap(
             #     f"{vis_dir}/cloth_{frame:03d}.obj",
             #     pos,
@@ -121,11 +121,13 @@ def main_data_collection():
             #     width, height,
             #     sim.thickness
             # )
+            sphere_params=sim.sphere_params.copy_to_host()
             renderer.render_frame(
                 pos, 
-                vel, # 여기에 시각화하고 싶은 값을 넣게 (Strain, Velocity 등)
+                penetration, # 여기에 시각화하고 싶은 값을 넣게 (Strain, Velocity 등)
                 frame,
-                # mode='visual'
+                mode='visual',
+                sphere_params = sphere_params
             )
 
     print(f"✅ Data Collection Finished! Saved to {dataset_dir}/")

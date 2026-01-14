@@ -60,8 +60,8 @@ def create_gif_from_folder(source_folder, output_filename="simulation_result.gif
 if __name__ == "__main__":
     # --- 사용 예시 ---
 
-    input_dir = '../xpbd_wind_SDF_v6'
-    output_name = '../xbpd_wind_SDF_v6.gif'
+    input_dir = '../xpbd_256_thick'
+    output_name = '../xbpd_256_thick_v1.gif'
 
     # 함수 실행
-    create_gif_from_folder(input_dir, output_name, fps=60)
+    create_gif_from_folder(input_dir, output_name, fps=30)

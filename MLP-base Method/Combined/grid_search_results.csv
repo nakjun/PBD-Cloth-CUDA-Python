@@ -1,0 +1,5 @@
+Resolution,Particles,Average_FPS,Average_Active_Ratio_Percent
+128x128,16384,37.20,0.00
+256x256,65536,46.98,0.00
+512x512,262144,26.97,0.00
+1024x1024,1048576,4.54,0.00

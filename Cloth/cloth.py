@@ -3,7 +3,7 @@ import numpy as np
 from numba import cuda
 from PBD.module import predict_position_kernel, update_velocity_kernel
 from PBD.module import solve_distance_constraint_colored_kernel
-from PBD.module import compute_hash_kernel, find_cell_start_end_kernel, solve_self_collision_friction_kernel, apply_aerodynamics_kernel
+from PBD.module import compute_hash_kernel, find_cell_start_end_kernel, solve_self_collision_friction_kernel, apply_aerodynamics_kernel,solve_environment_collision_kernel
 from PBD.coloring import compute_graph_coloring
 import math
 
@@ -11,168 +11,162 @@ HASH_TABLE_SIZE = 1000003  # 해시 테이블 크기 (충분히 크게)
 CELL_SIZE = 0.1          # 격자 크기 (파티클 간격과 비슷하거나 약간 크게)
 
 class ClothSimulator:
-    def __init__(self, width, height, spacing=0.1):
-        self.dt = 0.01
-        self.substeps = 10  # PBD는 작은 스텝을 여러 번 돌려야 안정적임
-
-        # 1. 그리드 메쉬 생성
+    def __init__(self, width, height, physical_width=10.0, dt=0.01, substeps=10):
+        """
+        [Resolution Independent Setup]
+        width, height: 파티클 격자의 해상도 (개수)
+        physical_width: 천의 실제 물리적 가로 길이 (미터)
+        """
+        self.dt = dt
+        self.substeps = substeps
+        
+        # 1. Spacing 및 물리 크기 자동 계산
+        # 해상도(width)가 변해도 물리적 크기(physical_width)는 유지됨
         self.num_x = width
         self.num_y = height
         num_particles = width * height
+        self.num_particles = num_particles
+        
+        # 파티클 간격 = 물리적 길이 / (개수 - 1)
+        spacing = physical_width / (width - 1)
+        self.spacing = spacing
+        
+        # 물리적 세로 길이 (정사각형 격자 가정)
+        physical_height = spacing * (height - 1)
 
-        # Flag 형태의 천을 생성합니다.
+        print(f"🎓 Simulation Init: Resolution=({width}x{height})")
+        print(f"   -> Physical Size=({physical_width:.2f}m x {physical_height:.2f}m)")
+        print(f"   -> Particle Spacing={spacing:.4f}m")
+
+        # 2. Sphere 설정 (천의 크기에 비례하여 자동 조절)
+        # 반지름: 천 가로 폭의 30%
+        sphere_radius = physical_width * 0.3
+        
+        # 위치: 천의 정중앙(X, Z), 높이(Y)는 반지름의 절반만큼 아래로 내려서 윗면이 0 근처에 오게 함
+        sphere_center_x = physical_width * 0.5 + sphere_radius
+        sphere_center_y = sphere_radius + 0.3
+        sphere_center_z = physical_height * 0.5
+        
+        sphere_center = np.array([sphere_center_x, sphere_center_y, sphere_center_z], dtype=np.float32)
+        
+        print(f"   -> Sphere: Center={sphere_center}, Radius={sphere_radius:.2f}")
+        self.sphere_params = cuda.to_device(np.concatenate([sphere_center, [sphere_radius]]))
+
+        # 마찰 및 바닥 설정
+        self.floor_height = 0.0
+        self.floor_friction = 0.9   # 바닥: 거침
+        self.sphere_friction = 0.02 # 구체: 매우 미끄러움 (Sliding 유도)
+
+        # 3. 파티클 초기 위치 생성 (Dropping Scenario)
         pos_host = np.zeros((num_particles, 3), dtype=np.float32)
-        start_y = 2.0 # 높이 조금 Up (깃발 느낌)
-        flag_wave_amplitude = spacing * 0.6  # 파도 높이 (조절 가능)
-        flag_wave_frequency = 2.0            # 파도 빈도 (파장=늘릴수록 느리고 큼)
-        flag_offset = 0.0                    # y방향 오프셋
-
+        
+        # 시작 높이: 구체 윗면보다 약간 위
+        start_y = sphere_center_y + sphere_radius + (physical_width * 0.1)
+        
         for y in range(height):
             for x in range(width):
                 idx = y * width + x
 
-                # 깃발은 X=0 쪽 (막대기)에서 시작해서 +X로 뻗음, Z방향으로 물결침
                 pos_x = x * spacing
-                pos_y = (height - y - 1) * spacing + start_y  # 맨 위가 start_y (축 방향 보정)
-                pos_z = math.sin(x * flag_wave_frequency * math.pi / width) * flag_wave_amplitude
-                # "날리는" 느낌 가미: 아래로 갈수록 파도 줄어듦
-                pos_z *= (1.0 - y / (height-1)) if height > 1 else 1.0
+                pos_z = y * spacing
+                pos_y = start_y 
+                
+                # 미세한 노이즈로 자연스러운 주름 유도
+                pos_y += np.random.uniform(-spacing*0.1, spacing*0.1)
 
                 pos_host[idx] = [pos_x, pos_y, pos_z]
 
-        indices = []
+        # 4. 제약 조건 (Constraints) 생성: Structural + Shear
         constraints = []
+        rest_lengths_list = []
 
-        # [SCENE SETUP] "The Squeezed Curtain"
-        # 윗부분을 30%로 압축하여 강제로 주름을 만듭니다.
-        compression_ratio = 0.5  # 1.0이면 평평함, 0.3이면 매우 쭈글쭈글함
-
-        # for y in range(height):
-        #     for x in range(width):
-        #         idx = y * width + x
-
-        #         # 아코디언/커튼 효과: x축은 압축, z축은 사인파, 아래쪽이 펼쳐지게 y로 lerp할 수도 있음
-        #         center_x = (width - 1) * spacing / 2.0
-        #         original_x = x * spacing
-
-        #         # 주름진 초기 상태: sine wave를 z축에 덧입힘
-        #         freq = 1.5  # 주름의 빈도
-        #         amp = spacing * 2.0 # 주름의 깊이
-
-        #         z_offset = np.sin(x * freq) * amp
-
-        #         # X축을 compression_ratio로 완전히 압축 (더 복잡하게 하려면 y에 따라 lerp 가능)
-        #         pos_host[idx] = [x * spacing * compression_ratio, -y * spacing + (height * spacing), z_offset]
-
-        #         # Structural Constraints 생성 (동일)
-        #         if x < width - 1:
-        #             constraints.append([idx, idx + 1])
-        #         if y < height - 1:
-        #             constraints.append([idx, idx + width])
-
-        constraints = []
         for y in range(height):
             for x in range(width):
                 idx = y * width + x
                 
-                # 1. Structural (가로/세로) - 기존
+                # (1) Structural (가로/세로)
                 if x < width - 1: 
                     constraints.append([idx, idx + 1])
+                    rest_lengths_list.append(spacing)
                 if y < height - 1: 
                     constraints.append([idx, idx + width])
+                    rest_lengths_list.append(spacing)
                 
-                # 2. Shear (대각선) - [NEW] 추가!
-                # 천의 뒤틀림을 막아주어 형태를 유지함
+                # (2) Shear (대각선) - 천의 뒤틀림 방지
+                diag_dist = spacing * math.sqrt(2)
                 if x < width - 1 and y < height - 1:
-                    constraints.append([idx, idx + width + 1])      # ↘ 대각선
-                    constraints.append([idx + 1, idx + width])      # ↙ 대각선
+                    constraints.append([idx, idx + width + 1])      # ↘
+                    rest_lengths_list.append(diag_dist)
+                    constraints.append([idx + 1, idx + width])      # ↙
+                    rest_lengths_list.append(diag_dist)
 
-        self.num_particles = num_particles
         self.num_constraints = len(constraints)
+        print(f"   -> Constraints Generated: {self.num_constraints} (Structural + Shear)")
 
-        # [NEW] Graph Coloring 수행 (CPU)
-        print("Computing Graph Coloring...")
+        # 5. Graph Coloring (병렬 처리를 위한 배치 분할)
+        print("   -> Computing Graph Coloring...")
         color_batches_host = compute_graph_coloring(num_particles, constraints)
-
-        # [NEW] 배치들을 GPU로 업로드
+        
+        # 배치들을 GPU로 업로드
         self.d_color_batches = []
         for batch in color_batches_host:
             self.d_color_batches.append(cuda.to_device(batch))
+        print(f"   -> Graph Coloring Done: {len(self.d_color_batches)} batches.")
 
-        # 2. 데이터 GPU 할당
+        # 6. 데이터 GPU 할당
         self.d_pos = cuda.to_device(pos_host)
-        self.d_pos_pred = cuda.to_device(pos_host)  # 예측 위치 버퍼
+        self.d_pos_pred = cuda.to_device(pos_host)
         self.d_vel = cuda.to_device(np.zeros_like(pos_host))
 
-        # [질량 설정 수정]
-        # 맨 윗줄 전체(y=0)를 고정 (커튼 연출)
-        mass_inv = np.ones(num_particles, dtype=np.float32)
-        # for x in range(width):
-        #     mass_inv[x] = 0.0 
-        mass_inv[0] = 0.0
+        # [Mass Scaling] 해상도에 따른 질량 자동 조절
+        # 기준: spacing=0.1일 때 mass=1.0
+        ref_spacing = 0.1
+        particle_mass = (spacing / ref_spacing) ** 2 
+        mass_inv = np.ones(num_particles, dtype=np.float32) * (1.0 / particle_mass)
         self.d_mass_inv = cuda.to_device(mass_inv)
 
-        # 제약 조건 GPU 할당
-        constraints = np.array(constraints, dtype=np.int32)
-        self.d_constraints = cuda.to_device(constraints)
+        # 제약 조건 데이터 업로드
+        self.d_constraints = cuda.to_device(np.array(constraints, dtype=np.int32))
+        self.d_rest_lengths = cuda.to_device(np.array(rest_lengths_list, dtype=np.float32))
 
-        # Rest Length 계산
-        # rest_lengths = np.linalg.norm(pos_host[constraints[:, 0]] - pos_host[constraints[:, 1]], axis=1)
-        rest_lengths_list = []
-        for y in range(height):
-            for x in range(width):
-                # Structural
-                if x < width - 1: rest_lengths_list.append(spacing)
-                if y < height - 1: rest_lengths_list.append(spacing)
-                # Shear
-                if x < width - 1 and y < height - 1:
-                    rest_lengths_list.append(spacing * math.sqrt(2)) # 대각선 길이
-                    rest_lengths_list.append(spacing * math.sqrt(2))
-
-        rest_lengths = np.array(rest_lengths_list, dtype=np.float32)
-
-        self.d_rest_lengths = cuda.to_device(rest_lengths.astype(np.float32))
-
-        # CUDA Block/Grid 설정
-        self.threads_per_block = 256
-        self.blocks_particles = (self.num_particles + self.threads_per_block - 1) // self.threads_per_block
-        self.blocks_constraints = (self.num_constraints + self.threads_per_block - 1) // self.threads_per_block
-
-        # Self-Collision용 버퍼
+        # 7. Spatial Hashing 및 충돌 관련 버퍼
         self.d_particle_hashes = cuda.device_array(self.num_particles, dtype=np.int32)
         self.d_particle_indices = cuda.device_array(self.num_particles, dtype=np.int32)
         
-        # Grid Cell 정보 (Start/End)
         self.d_cell_start = cuda.device_array(HASH_TABLE_SIZE, dtype=np.int32)
         self.d_cell_end = cuda.device_array(HASH_TABLE_SIZE, dtype=np.int32)
         
-        # 파티클 두께 (Self Collision 거리)
-        self.thickness = spacing * 0.3 # 간격보다 조금 작게
-
-        self.spacing = spacing
-
-        # Penetration Depth 버퍼
+        # Self-Collision 파라미터
+        self.thickness = spacing * 0.7
+        self.collision_margin = self.thickness * 0.5
+        
+        # 디버깅/시각화용 Penetration 버퍼
         self.d_penetration = cuda.device_array(self.num_particles, dtype=np.float32)
 
+        # 8. 렌더링용 Topology (Faces) 생성
         faces_list = []
         for y in range(height - 1):
             for x in range(width - 1):
                 idx = y * width + x
-                # Triangle 1: (idx, idx+1, idx+width+1)
-                # Triangle 2: (idx, idx+width+1, idx+width)
-                # 주의: 렌더링용과 다르게 '3' 같은 헤더 없이 순수 인덱스만 저장
+                # Triangle 1
                 faces_list.append([idx, idx + 1, idx + width + 1])
+                # Triangle 2
                 faces_list.append([idx, idx + width + 1, idx + width])
-
+        
         faces_array = np.array(faces_list, dtype=np.int32)
         self.num_faces = len(faces_array)
-        self.d_faces = cuda.to_device(faces_array) # GPU 업로드
+        self.d_faces = cuda.to_device(faces_array)
 
-        # 2. 공기 역학 파라미터 정의
-        self.rho = 1.225            # 공기 밀도 (kg/m^3)
-        self.drag_coeff = 2.5       # 항력 계수 (Drag) - 바람에 밀리는 힘
-        self.lift_coeff = 0.5       # 양력 계수 (Lift) - 뜨는 힘
-        self.wind_vel = cuda.to_device(np.array([0.0, 0.0, 8.0], dtype=np.float32)) # Z방향 강풍
+        # 9. 공기 역학 (Aerodynamics)
+        self.rho = 1.225
+        self.drag_coeff = 2.5
+        self.lift_coeff = 0.5
+        # Z방향으로 부는 바람
+        self.wind_vel = cuda.to_device(np.array([0.0, 0.0, 3.0], dtype=np.float32))
+
+        # 10. CUDA 실행 설정
+        self.threads_per_block = 256
+        self.blocks_particles = (self.num_particles + self.threads_per_block - 1) // self.threads_per_block
 
     def _sort_particles_torch(self):
         """
@@ -219,10 +213,10 @@ class ClothSimulator:
 
     def step(self):
 
-        # compliance = 0.0       # 완전 딱딱함 (비신축성, 실크/면)
-        # compliance = 0.00001   # 아주 약간 늘어남 (나일론)
-        # compliance = 0.005     # 고무줄/스판덱스
-        target_compliance = 0.0000001 # 거의 0에 가깝게 설정하여 기존 천 느낌 유지
+        target_compliance = 0.0       # 완전 딱딱함 (비신축성, 실크/면)
+        # target_compliance = 0.00001   # 아주 약간 늘어남 (나일론)
+        # target_compliance = 0.005     # 고무줄/스판덱스
+        # target_compliance = 0.0000001 # 거의 0에 가깝게 설정하여 기존 천 느낌 유지
 
         dt_sub = self.dt / self.substeps
 
@@ -255,6 +249,22 @@ class ClothSimulator:
                 dt_sub, -9.8, self.num_particles
             )
 
+            # ------------------------------------------------------------------
+            # [Stage 1.5] Environment Collision (Sphere SDF)
+            # ------------------------------------------------------------------
+            # 예측된 위치가 구 안으로 들어갔다면 즉시 밀어냄
+            solve_environment_collision_kernel[self.blocks_particles, self.threads_per_block](
+                self.d_pos_pred,    
+                self.d_pos,         
+                self.d_mass_inv,
+                self.sphere_params,
+                self.sphere_friction, # 구 마찰
+                self.floor_height,    # [NEW] 바닥 높이
+                self.floor_friction,  # [NEW] 바닥 마찰
+                dt_sub,
+                self.num_particles,
+                self.collision_margin
+            )
             # ------------------------------------------------------------------
             # [Stage 2] Distance Constraints (XPBD + Graph Coloring)
             # ------------------------------------------------------------------

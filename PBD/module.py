@@ -237,11 +237,10 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                                          num_particles, thickness, 
                                          penetration_buffer, dt):
     """
-    [Professor's Final Version]
-    - Spatial Hashing 기반 Self-Collision
-    - Stiffness 적용 (Soft Constraint)
-    - Max Displacement Clamp 적용 (Explosion 방지)
-    - Coulomb Friction 적용
+    [Professor's Emergency Fix]
+    - XPBD 기반이지만 강력한 Clamping을 적용하여 폭발 방지
+    - Penetration Cap: 너무 깊은 침투는 무시 (Softness 유지)
+    - Friction Cap: 마찰로 인한 이동량이 너무 크면 강제 제한
     """
     idx = cuda.grid(1)
     if idx >= num_particles: return
@@ -249,59 +248,60 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
     w_i = mass_inv[idx]
     if w_i == 0.0: return
     
-    # 1. 현재 예측 위치 (Candidate Position)
     px = pos_pred[idx, 0]
     py = pos_pred[idx, 1]
     pz = pos_pred[idx, 2]
 
-    # 2. 이전 위치 (Previous Position) - 상대 속도 및 마찰 계산용
     px_old = pos_old[idx, 0]
     py_old = pos_old[idx, 1]
     pz_old = pos_old[idx, 2]
     
-    # Spatial Hashing 좌표 계산 (Hardcoded CELL_SIZE=0.1 주의)
-    # 만약 spacing이 바뀌었다면 이 0.1도 맞춰서 바꿔줘야 함 (보통 spacing과 같거나 조금 크게)
     cell_size = 0.1
     grid_x = int(math.floor(px / cell_size))
     grid_y = int(math.floor(py / cell_size))
     grid_z = int(math.floor(pz / cell_size))
     
-    # --- Tuning Parameters ---
-    friction_mu_s = 0.5   # 정지 마찰 계수
-    friction_mu_k = 0.3   # 운동 마찰 계수
-    
-    # [핵심 1] Stiffness: 한 번에 100% 밀어내지 않고 부드럽게 (10%씩)
-    # Substeps가 많으므로(30~40회), 작은 값이어도 충분히 밀어냄
-    collision_stiffness = 0.1 
-    
-    # [핵심 2] Max Displacement: 한 번에 이동 가능한 최대 거리 제한
-    # 폭발적인 힘이 발생해도 이 이상 움직이지 못하게 막음 (Safety Clamp)
-    max_correction = thickness * 0.1
+    # --- Parameters ---
+    # 다시 약간 보수적으로 복귀
+    contact_compliance = 0.0001 # 0.001은 너무 물렁해서 깊게 박힘 -> 0.0001로 약간 단단하게
+    alpha_tilde = contact_compliance / (dt * dt)
 
-    max_depth = 0.0 # 시각화/디버깅용
+    friction_mu_k = 0.05 # 마찰은 낮게 유지
+    friction_mu_s = 0.05
+    
+    # [Safety Cap] 한 번의 충돌 해결로 움직일 수 있는 최대 거리
+    # thickness의 10%를 넘어가면 비정상적인 힘으로 간주하고 자름
+    max_displacement = thickness * 0.1 
 
-    # 3x3x3 이웃 셀 탐색
+    max_collisions = 8
+    collision_count = 0
+    
+    max_depth = 0.0
+    stop_search = False
+
+    # Neighbor Search
     for z in range(-1, 2):
+        if stop_search: break
         for y in range(-1, 2):
+            if stop_search: break
             for x in range(-1, 2):
+                if stop_search: break
+                
                 neighbor_x = grid_x + x
                 neighbor_y = grid_y + y
                 neighbor_z = grid_z + z
                 
-                # Hash Function
                 h = (neighbor_x * 73856093) ^ (neighbor_y * 19349663) ^ (neighbor_z * 83492791)
-                h = h % 1000003 # HASH_TABLE_SIZE
+                h = h % 1000003
                 
                 start_idx = cell_start[h]
                 end_idx = cell_end[h]
-                
                 if start_idx == -1: continue 
 
                 for k in range(start_idx, end_idx):
                     j = sorted_indices[k]
                     if idx == j: continue 
                     
-                    # 이웃 파티클 j 정보 로드
                     jx = pos_pred[j, 0]
                     jy = pos_pred[j, 1]
                     jz = pos_pred[j, 2]
@@ -310,111 +310,96 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                     w_sum = w_i + w_j
                     if w_sum == 0.0: continue
 
-                    # --- Collision Detection ---
                     dx = px - jx
                     dy = py - jy
                     dz = pz - jz
                     
                     dist_sq = dx*dx + dy*dy + dz*dz
-                    min_dist = thickness * 2.0 # 양쪽 반지름의 합
+                    min_dist = thickness * 2.0 
                     
-                    # 충돌 판정
                     if dist_sq < (min_dist * min_dist) and dist_sq > 1e-12:
                         dist = math.sqrt(dist_sq)
-                        penetration = min_dist - dist
                         
-                        # 시각화용 데이터 기록
-                        if penetration > max_depth:
-                            max_depth = penetration
+                        # [Safety 1] Penetration Cap
+                        # 실제 침투 깊이가 아무리 깊어도, 계산에는 'max_displacement'까지만 사용
+                        # 이렇게 해야 lambda_n이 폭발하지 않음
+                        actual_penetration = min_dist - dist
+                        penetration = actual_penetration
                         
-                        # Normal Vector (j -> i 방향, 즉 i를 밀어내는 방향)
+                        if penetration > max_displacement:
+                            penetration = max_displacement
+                        
+                        if actual_penetration > max_depth: max_depth = actual_penetration
+
                         nx = dx / dist
                         ny = dy / dist
                         nz = dz / dist
                         
-                        # ------------------------------------------------
-                        # [Step 1] Normal Position Correction (Repulsion)
-                        # ------------------------------------------------
-                        # correction magnitude (scalar)
-                        correction_mag = (penetration / w_sum) * collision_stiffness
+                        # [XPBD Step 1] Normal Solve
+                        lambda_n = penetration / (w_sum + alpha_tilde)
                         
-                        # [Safety] Clamp Correction Force
-                        if correction_mag > max_correction:
-                            correction_mag = max_correction
-
-                        # Apply Position Delta (Atomic Add)
-                        dx_n = nx * correction_mag * w_i
-                        dy_n = ny * correction_mag * w_i
-                        dz_n = nz * correction_mag * w_i
+                        dx_n = nx * lambda_n * w_i
+                        dy_n = ny * lambda_n * w_i
+                        dz_n = nz * lambda_n * w_i
                         
                         cuda.atomic.add(pos_pred, (idx, 0), dx_n)
                         cuda.atomic.add(pos_pred, (idx, 1), dy_n)
                         cuda.atomic.add(pos_pred, (idx, 2), dz_n)
                         
-                        # ------------------------------------------------
-                        # [Step 2] Friction Correction (Tangential)
-                        # ------------------------------------------------
-                        # i와 j의 상대 변위(Relative Displacement) 계산
+                        # [XPBD Step 2] Friction
                         jx_old = pos_old[j, 0]
                         jy_old = pos_old[j, 1]
                         jz_old = pos_old[j, 2]
                         
-                        # Delta P_i
                         disp_i_x = (px - px_old)
                         disp_i_y = (py - py_old)
                         disp_i_z = (pz - pz_old)
                         
-                        # Delta P_j
                         disp_j_x = (jx - jx_old)
                         disp_j_y = (jy - jy_old)
                         disp_j_z = (jz - jz_old)
                         
-                        # Relative Displacement
-                        rel_disp_x = disp_i_x - disp_j_x
-                        rel_disp_y = disp_i_y - disp_j_y
-                        rel_disp_z = disp_i_z - disp_j_z
+                        rel_x = disp_i_x - disp_j_x
+                        rel_y = disp_i_y - disp_j_y
+                        rel_z = disp_i_z - disp_j_z
                         
-                        # Tangential Component 추출
-                        # v_t = v_rel - (v_rel . n) * n
-                        dot_n = rel_disp_x * nx + rel_disp_y * ny + rel_disp_z * nz
+                        dot_n = rel_x*nx + rel_y*ny + rel_z*nz
+                        tan_x = rel_x - dot_n*nx
+                        tan_y = rel_y - dot_n*ny
+                        tan_z = rel_z - dot_n*nz
                         
-                        lat_x = rel_disp_x - dot_n * nx
-                        lat_y = rel_disp_y - dot_n * ny
-                        lat_z = rel_disp_z - dot_n * nz
+                        tan_len = math.sqrt(tan_x*tan_x + tan_y*tan_y + tan_z*tan_z)
                         
-                        lat_len = math.sqrt(lat_x*lat_x + lat_y*lat_y + lat_z*lat_z)
-                        
-                        if lat_len > 1e-10:
-                            # Tangent Direction
-                            tx = lat_x / lat_len
-                            ty = lat_y / lat_len
-                            tz = lat_z / lat_len
+                        if tan_len > 1e-6:
+                            tx = tan_x / tan_len
+                            ty = tan_y / tan_len
+                            tz = tan_z / tan_len
                             
-                            # Coulomb Friction Constraint
-                            # 수직 항력(Impulse)에 비례하는 한계치 설정
-                            # delta_lambda_n = correction_mag (위에서 계산한 값)
+                            limit = friction_mu_k * lambda_n
+                            friction_lambda = 0.0
                             
-                            # 마찰력 한계 (Kinetic Limit)
-                            limit = friction_mu_k * correction_mag * w_sum # w_sum을 곱해 위치 스케일 보정
-                            
-                            friction_correction = 0.0
-                            
-                            # Static vs Kinetic 판별
-                            if lat_len < (friction_mu_s * correction_mag * w_sum):
-                                # Static: 움직임을 완전히 상쇄
-                                friction_correction = lat_len
+                            if tan_len < (friction_mu_s * lambda_n * w_sum): 
+                                friction_lambda = tan_len / w_sum
                             else:
-                                # Kinetic: 한계치만큼만 저항
-                                friction_correction = limit
+                                friction_lambda = limit
                             
-                            # Apply Friction Delta (반대 방향으로 이동)
-                            scale = friction_correction / w_sum
+                            # [Safety 2] Friction Displacement Cap
+                            # 마찰 이동량이 너무 크면 강제로 자름 (폭발 방지의 핵심)
+                            friction_disp = friction_lambda * w_i
+                            if friction_disp > max_displacement:
+                                friction_lambda = max_displacement / w_i # 역산해서 제한
                             
-                            cuda.atomic.add(pos_pred, (idx, 0), -tx * scale * w_i)
-                            cuda.atomic.add(pos_pred, (idx, 1), -ty * scale * w_i)
-                            cuda.atomic.add(pos_pred, (idx, 2), -tz * scale * w_i)
+                            scale = friction_lambda * w_i
+                            
+                            cuda.atomic.add(pos_pred, (idx, 0), -tx * scale)
+                            cuda.atomic.add(pos_pred, (idx, 1), -ty * scale)
+                            cuda.atomic.add(pos_pred, (idx, 2), -tz * scale)
+                        
+                        collision_count += 1
+                        if collision_count >= max_collisions:
+                            stop_search = True
+                            break 
 
-    # 루프 종료 후 최대 침투 깊이 기록
     penetration_buffer[idx] = max_depth
 
 @cuda.jit
@@ -622,104 +607,118 @@ def apply_aerodynamics_kernel(pos, vel, faces, wind_vel, rho, cd, cl, dt, num_fa
 def solve_environment_collision_kernel(pos_pred, pos_old, mass_inv, 
                                        sphere_params, sphere_friction, 
                                        floor_height, floor_friction, 
-                                       dt, num_particles):
+                                       dt, num_particles, collision_margin):
     """
-    [Environment Solver] Sphere + Floor (Ground Plane)
-    한 커널에서 두 가지 환경 충돌을 모두 처리함.
+    [Professor's Fix]
+    Logic: Friction First -> Projection Second
+    밀어내는 힘(Projection)이 속도로 오인되어 가속되는 현상(Ghost Force)을 방지함.
     """
     idx = cuda.grid(1)
     if idx < num_particles:
         w = mass_inv[idx]
         if w == 0.0: return 
 
-        # 1. 위치 로드
+        # 현재 예측 위치
         px = pos_pred[idx, 0]
         py = pos_pred[idx, 1]
         pz = pos_pred[idx, 2]
 
+        # 이전 위치 (속도 계산용)
         old_x = pos_old[idx, 0]
         old_y = pos_old[idx, 1]
         old_z = pos_old[idx, 2]
 
-        # ---------------------------------------------------------
-        # [Object 1] Sphere SDF
-        # ---------------------------------------------------------
+        # =========================================================
+        # [Object 1] Sphere Collision
+        # =========================================================
         cx, cy, cz, radius = sphere_params[0], sphere_params[1], sphere_params[2], sphere_params[3]
+        radius = radius + collision_margin
         
         dx = px - cx
         dy = py - cy
         dz = pz - cz
-        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-
-        # 충돌 플래그 및 Normal/Penetration 저장 변수
-        collided = False
-        nx, ny, nz = 0.0, 0.0, 0.0
-        friction = 0.0
-
-        if dist < radius and dist > 1e-6:
-            # 구체 충돌 발생
-            collided = True
-            penetration = radius - dist
-            nx, ny, nz = dx/dist, dy/dist, dz/dist
-            friction = sphere_friction
+        dist_sq = dx*dx + dy*dy + dz*dz
+        
+        # 구체 충돌 감지
+        if dist_sq < (radius * radius) and dist_sq > 1e-12:
+            dist = math.sqrt(dist_sq)
             
-            # 위치 보정 (Projection)
+            # Normal Vector
+            nx = dx / dist
+            ny = dy / dist
+            nz = dz / dist
+            
+            # Penetration Depth
+            penetration = radius - dist
+            
+            # -----------------------------------------------------
+            # [Step 1] Friction (Velocity Damping)
+            # -----------------------------------------------------
+            # 밀어내기(Projection) 전에 현재 속도에 대해 마찰을 먼저 적용해야 함.
+            
+            # Current Velocity (Prediction based)
+            vx = px - old_x
+            vy = py - old_y
+            vz = pz - old_z
+            
+            # Normal Component of Velocity (v . n)
+            v_dot_n = vx * nx + vy * ny + vz * nz
+            
+            # Tangential Velocity (v_t = v - v_n)
+            vt_x = vx - v_dot_n * nx
+            vt_y = vy - v_dot_n * ny
+            vt_z = vz - v_dot_n * nz
+            
+            # Apply Friction Damping
+            # scale = 1.0 (No friction) ~ 0.0 (Full stop)
+            # Simple Damping: v_t_new = v_t * (1 - mu)
+            f_scale = 1.0 - sphere_friction
+            if f_scale < 0.0: f_scale = 0.0
+            
+            # Update Velocity (Position) with Friction
+            # (Note: Normal component is kept as is, Projection will handle it)
+            px = old_x + (v_dot_n * nx) + (vt_x * f_scale)
+            py = old_y + (v_dot_n * ny) + (vt_y * f_scale)
+            pz = old_z + (v_dot_n * nz) + (vt_z * f_scale)
+            
+            # -----------------------------------------------------
+            # [Step 2] Projection (SDF Push)
+            # -----------------------------------------------------
+            # 마찰이 적용된 위치에서 밖으로 밀어냄
             px += nx * penetration
             py += ny * penetration
             pz += nz * penetration
 
-        # ---------------------------------------------------------
-        # [Object 2] Floor Plane (y > floor_height)
-        # ---------------------------------------------------------
-        # 구체 처리가 끝난 px, py, pz를 기준으로 바닥 검사
-        # (구체에서 밀려나왔더니 바닥을 뚫는 경우도 처리됨)
+        # =========================================================
+        # [Object 2] Floor Collision
+        # =========================================================
+        # 구체 처리 후의 위치(px, py, pz)를 기준으로 바닥 체크
         
         if py < floor_height:
-            # 바닥 충돌 발생
-            # 만약 구체와 동시에 충돌했다면? -> 바닥이 우선순위가 높음 (Hard Floor)
-            # 혹은 벡터를 합쳐야 하지만, 여기서는 순차적으로 처리 (Sequential Impulse)
+            # -----------------------------------------------------
+            # [Step 1] Friction (Floor)
+            # -----------------------------------------------------
+            # 바닥의 Normal은 (0, 1, 0)이므로 계산이 매우 간단함
             
-            collided = True
-            penetration = floor_height - py
+            # Current Velocity
+            vx = px - old_x
+            vy = py - old_y # 바닥 방향 속도
+            vz = pz - old_z
             
-            # 바닥의 Normal은 무조건 (0, 1, 0)
-            # 바닥 마찰 계수 적용
-            friction = floor_friction 
-            nx, ny, nz = 0.0, 1.0, 0.0 
+            # Tangential Velocity is just (vx, vz) since Normal is Y-axis
+            # Friction Apply
+            f_scale = 1.0 - floor_friction
+            if f_scale < 0.0: f_scale = 0.0
             
-            # 위치 보정 (Projection)
-            py = floor_height # 강제로 바닥 위로 올림
+            # 수평 속도 감속
+            px = old_x + (vx * f_scale)
+            pz = old_z + (vz * f_scale)
+            # py는 아래 Projection에서 덮어씌워지므로 계산 불필요 (단, 탄성 충돌이 아닐 경우)
             
-            # 갱신된 좌표 반영
-            px = px
-            pz = pz
-
-        # ---------------------------------------------------------
-        # [Common] Friction Apply
-        # ---------------------------------------------------------
-        if collided:
-            # 위치가 보정되었으므로(px, py, pz), 마찰 적용
-            # 이동 벡터 (Delta)
-            delta_x = px - old_x
-            delta_y = py - old_y
-            delta_z = pz - old_z
-            
-            # Normal Component (v . n)
-            dot_n = delta_x * nx + delta_y * ny + delta_z * nz
-            
-            # Tangent Component
-            tan_x = delta_x - dot_n * nx
-            tan_y = delta_y - dot_n * ny
-            tan_z = delta_z - dot_n * nz
-            
-            # Friction Damping
-            scale = 1.0 - friction
-            if scale < 0.0: scale = 0.0
-            
-            # Apply Friction
-            px = old_x + (delta_x * nx * nx) + (tan_x * scale)
-            py = old_y + (delta_y * ny * ny) + (tan_y * scale)
-            pz = old_z + (delta_z * nz * nz) + (tan_z * scale)
+            # -----------------------------------------------------
+            # [Step 2] Projection (Hard Floor)
+            # -----------------------------------------------------
+            py = floor_height
 
         # 최종 위치 저장
         pos_pred[idx, 0] = px
