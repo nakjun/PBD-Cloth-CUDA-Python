@@ -235,16 +235,45 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                                          cell_start, cell_end, 
                                          sorted_indices, particle_hashes, 
                                          num_particles, thickness, 
-                                         penetration_buffer, dt):
+                                         penetration_buffer, dt,
+                                         # [NEW] 추가된 인자들
+                                         visibility, frame_idx): 
     """
-    [Professor's Emergency Fix]
-    - XPBD 기반이지만 강력한 Clamping을 적용하여 폭발 방지
-    - Penetration Cap: 너무 깊은 침투는 무시 (Softness 유지)
-    - Friction Cap: 마찰로 인한 이동량이 너무 크면 강제 제한
+    [Novelty Update] View-Dependent Culling 적용
+    visibility 버퍼 값을 확인하여 뒷면(Back-facing) 파티클은 확률적으로 충돌 검사를 건너뜁니다.
     """
     idx = cuda.grid(1)
     if idx >= num_particles: return
 
+    # ============================================================
+    # [NOVELTY LOGIC START] View-Dependent Stochastic Culling
+    # ============================================================
+    vis_score = visibility[idx]
+    
+    # 임계값 설정: 0.2 미만이면 '뒷면' 혹은 '측면 뒤쪽'으로 간주
+    culling_threshold = 0.2 
+
+    if vis_score < culling_threshold:
+        # --- 확률적 스킵 (Stochastic Skipping) ---
+        # 매 프레임, 매 파티클마다 다른 랜덤 값을 생성하기 위한 간단한 해시 함수
+        # (frame_idx가 변하면서 매번 다른 결과가 나옴)
+        seed = idx * 12345 + frame_idx * 67897
+        # Linear Congruential Generator (LCG) 방식 난수 생성
+        rand_state = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        rand_float = float(rand_state) / 2147483648.0 # 0.0 ~ 1.0 사이 실수
+        
+        # 스킵 확률 설정 (예: 70% 확률로 스킵)
+        # 너무 높으면 뚫림이 보이고, 너무 낮으면 성능 이득이 적음
+        skip_probability = 0.7
+
+        if rand_float < skip_probability:
+            # 🎲 당첨! 이번 프레임 이 파티클은 비싼 충돌 검사를 안 하고 넘어갑니다.
+            # 성능 향상의 핵심 포인트입니다.
+            return 
+    # ============================================================
+    # [NOVELTY LOGIC END]
+    # ============================================================
+    
     w_i = mass_inv[idx]
     if w_i == 0.0: return
     
@@ -256,10 +285,11 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
     py_old = pos_old[idx, 1]
     pz_old = pos_old[idx, 2]
     
-    cell_size = 0.1
-    grid_x = int(math.floor(px / cell_size))
-    grid_y = int(math.floor(py / cell_size))
-    grid_z = int(math.floor(pz / cell_size))
+    # CELL_SIZE가 상수로 정의되어 있다고 가정합니다.
+    # 만약 아니라면 인자로 받아야 합니다.
+    grid_x = int(math.floor(px / CELL_SIZE))
+    grid_y = int(math.floor(py / CELL_SIZE))
+    grid_z = int(math.floor(pz / CELL_SIZE))
     
     # --- Parameters ---
     # 다시 약간 보수적으로 복귀
@@ -291,8 +321,9 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                 neighbor_y = grid_y + y
                 neighbor_z = grid_z + z
                 
+                # HASH_TABLE_SIZE가 상수로 정의되어 있다고 가정합니다.
                 h = (neighbor_x * 73856093) ^ (neighbor_y * 19349663) ^ (neighbor_z * 83492791)
-                h = h % 1000003
+                h = h % HASH_TABLE_SIZE
                 
                 start_idx = cell_start[h]
                 end_idx = cell_end[h]
@@ -724,3 +755,96 @@ def solve_environment_collision_kernel(pos_pred, pos_old, mass_inv,
         pos_pred[idx, 0] = px
         pos_pred[idx, 1] = py
         pos_pred[idx, 2] = pz
+
+@cuda.jit
+def compute_visibility_kernel(pos, faces, normals, visibility, cam_pos, num_faces, num_particles):
+    """
+    [Novelty Kernel] View-Dependent Culling을 위한 가시성 계산
+    1. Face Normal을 이용해 파티클별 Vertex Normal을 계산합니다.
+    2. 카메라 위치(cam_pos)와 Normal을 내적하여 Visibility Score를 계산합니다.
+       (1.0: 정면, 0.0: 측면, -1.0: 완전 뒷면)
+    """
+    # 1. Normal 버퍼 초기화 (Atomic Add를 사용하기 때문에 필수)
+    idx = cuda.grid(1)
+    if idx < num_particles:
+        normals[idx, 0] = 0.0
+        normals[idx, 1] = 0.0
+        normals[idx, 2] = 0.0
+        visibility[idx] = 1.0 # 기본값은 '보임'으로 설정
+
+    # 스레드 동기화: 모든 초기화가 끝날 때까지 기다림
+    cuda.syncthreads()
+
+    # 2. Face Normal 계산 및 누적 (Scatter 방식)
+    # 각 Face가 스레드가 되어 자신의 법선을 구성 Vertex들에 더해줍니다.
+    f_idx = cuda.grid(1)
+    if f_idx < num_faces:
+        # 삼각형의 세 정점 인덱스 가져오기
+        i1 = faces[f_idx, 0]
+        i2 = faces[f_idx, 1]
+        i3 = faces[f_idx, 2]
+
+        # 각 정점의 현재 위치 가져오기 (pos는 예측된 위치인 pos_pred 사용 예정)
+        p1_x, p1_y, p1_z = pos[i1, 0], pos[i1, 1], pos[i1, 2]
+        p2_x, p2_y, p2_z = pos[i2, 0], pos[i2, 1], pos[i2, 2]
+        p3_x, p3_y, p3_z = pos[i3, 0], pos[i3, 1], pos[i3, 2]
+
+        # 두 변의 벡터 계산
+        u_x, u_y, u_z = p2_x - p1_x, p2_y - p1_y, p2_z - p1_z
+        v_x, v_y, v_z = p3_x - p1_x, p3_y - p1_y, p3_z - p1_z
+
+        # 외적(Cross Product)으로 Face Normal 계산
+        nx = u_y * v_z - u_z * v_y
+        ny = u_z * v_x - u_x * v_z
+        nz = u_x * v_y - u_y * v_x
+
+        # Atomic Add를 사용해 각 정점에 법선 누적 (여러 Face가 공유하므로 충돌 방지)
+        cuda.atomic.add(normals, (i1, 0), nx)
+        cuda.atomic.add(normals, (i1, 1), ny)
+        cuda.atomic.add(normals, (i1, 2), nz)
+        
+        cuda.atomic.add(normals, (i2, 0), nx)
+        cuda.atomic.add(normals, (i2, 1), ny)
+        cuda.atomic.add(normals, (i2, 2), nz)
+        
+        cuda.atomic.add(normals, (i3, 0), nx)
+        cuda.atomic.add(normals, (i3, 1), ny)
+        cuda.atomic.add(normals, (i3, 2), nz)
+
+    # 스레드 동기화: 모든 누적이 끝날 때까지 기다림
+    cuda.syncthreads()
+
+    # 3. 정규화 및 가시성 점수 계산
+    # 다시 파티클 단위 스레드로 작업
+    p_idx = cuda.grid(1)
+    if p_idx < num_particles:
+        nx = normals[p_idx, 0]
+        ny = normals[p_idx, 1]
+        nz = normals[p_idx, 2]
+
+        # 법선 벡터 정규화 (길이를 1로 만듦)
+        length = math.sqrt(nx*nx + ny*ny + nz*nz)
+        if length > 1e-12:
+            nx /= length
+            ny /= length
+            nz /= length
+            
+            # 카메라 시선 벡터 계산 (카메라 위치 - 파티클 위치)
+            px, py, pz = pos[p_idx, 0], pos[p_idx, 1], pos[p_idx, 2]
+            vx = cam_pos[0] - px
+            vy = cam_pos[1] - py
+            vz = cam_pos[2] - pz
+            
+            # 시선 벡터 정규화
+            v_len = math.sqrt(vx*vx + vy*vy + vz*vz)
+            if v_len > 1e-12:
+                vx /= v_len
+                vy /= v_len
+                vz /= v_len
+                
+                # 내적(Dot Product) 계산: (Normal . View)
+                dot = nx*vx + ny*vy + nz*vz
+                visibility[p_idx] = dot # -1.0 ~ 1.0 사이 값 저장
+        else:
+            # 법선 계산이 불가능한 경우(예: 고립된 점)는 보인다고 가정
+            visibility[p_idx] = 1.0

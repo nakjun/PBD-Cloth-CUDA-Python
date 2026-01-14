@@ -157,6 +157,23 @@ class ClothSimulator:
         self.num_faces = len(faces_array)
         self.d_faces = cuda.to_device(faces_array)
 
+        # [NEW] View-Dependent Culling을 위한 데이터 할당
+        # 1. 법선 벡터 버퍼 (N, 3)
+        self.frame_count = 0
+        self.d_normals = cuda.device_array((self.num_particles, 3), dtype=np.float32)
+        # 2. 가시성 점수 버퍼 (N,)
+        self.d_visibility = cuda.device_array(self.num_particles, dtype=np.float32)
+        
+        # 3. 가상 카메라 위치 설정
+        # 렌더링 시점과 비슷하게 맞춰주면 효과가 좋습니다.
+        # (예: 약간 위에서 아래로 내려다보는 시점)
+        camera_pos_host = np.array([self.num_x * self.spacing * 0.5,  # X: 천 중앙
+                                    10.0,                             # Y: 높게
+                                    self.num_y * self.spacing * 1.5], # Z: 천 앞쪽으로 멀리
+                                   dtype=np.float32)
+        self.d_camera_pos = cuda.to_device(camera_pos_host)
+        print(f"   -> Virtual Camera Pos for Culling: {camera_pos_host}")
+
         # 9. 공기 역학 (Aerodynamics)
         self.rho = 1.225
         self.drag_coeff = 2.5
@@ -167,6 +184,37 @@ class ClothSimulator:
         # 10. CUDA 실행 설정
         self.threads_per_block = 256
         self.blocks_particles = (self.num_particles + self.threads_per_block - 1) // self.threads_per_block
+
+# ---------------------------------------------------------
+        # [GPU Memory Usage Info] 초기화 후 메모리 사용량 출력
+        # ---------------------------------------------------------
+        try:
+            # [수정됨] Numba 컨텍스트를 통해 메모리 정보 가져오기
+            # cuda.current_context().get_memory_info()는 (free, total) 튜플을 바이트 단위로 반환합니다.
+            # 이 방식이 더 호환성이 높습니다.
+            ctx = cuda.current_context()
+            free_mem, total_mem = ctx.get_memory_info()
+            
+            used_mem = total_mem - free_mem
+            
+            # GB 단위로 변환
+            total_gb = total_mem / (1024**3)
+            used_gb = used_mem / (1024**3)
+            free_gb = free_mem / (1024**3)
+            usage_percent = (used_mem / total_mem) * 100 if total_mem > 0 else 0
+
+            print("-" * 50)
+            print(f"💾 GPU Memory Usage (After Init):")
+            print(f"   - Total: {total_gb:.2f} GB")
+            print(f"   - Used : {used_gb:.2f} GB ({usage_percent:.1f}%)")
+            print(f"   - Free : {free_gb:.2f} GB")
+            print("-" * 50)
+            
+        except Exception as e:
+            # 만약 이 방식도 실패하면 에러 메시지를 자세히 출력
+            import traceback
+            traceback.print_exc()
+            print(f"[Warning] Failed to get GPU memory info: {e}")
 
     def _sort_particles_torch(self):
         """
@@ -217,6 +265,7 @@ class ClothSimulator:
         # target_compliance = 0.00001   # 아주 약간 늘어남 (나일론)
         # target_compliance = 0.005     # 고무줄/스판덱스
         # target_compliance = 0.0000001 # 거의 0에 가깝게 설정하여 기존 천 느낌 유지
+        self.frame_count += 1
 
         dt_sub = self.dt / self.substeps
 
@@ -306,7 +355,8 @@ class ClothSimulator:
                 self.d_cell_start, self.d_cell_end, 
                 self.d_particle_indices, self.d_particle_hashes, 
                 self.num_particles, self.thickness, self.d_penetration,
-                dt_sub
+                dt_sub,
+                self.d_visibility, self.frame_count
             )
 
             # ------------------------------------------------------------------

@@ -1,136 +1,178 @@
+import sys
 import os
-
 import numpy as np
-from Cloth.cloth import ClothSimulator
-from PBD.render_utils import ClothRenderer
+import math
+import time
 from tqdm import tqdm
+from numba import cuda
 
-# [기존 함수 유지] 색상(RGB)을 포함하여 OBJ 저장 & 침투 깊이 기반 보정
-def save_obj_with_heatmap(filename, vertices, penetrations, width, height, thickness):
-    """
-    [Upgrade] Heatmap Color + UV Coordinates (Texture Mapping)
-    """
-    diameter = thickness * 1.5
-    ignore_threshold = diameter * 0.05 
-    critical_threshold = diameter * 0.3
+# 프로젝트 루트 경로 추가 (모듈 import용)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, ".."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
-    with open(filename, 'w') as f:
-        f.write("# Powerful Cloth Sim with UVs\n")
+# PBD 모듈 및 유틸리티 import
+from PBD.cloth import ClothSimulator
+from PBD.render_utils import ClothRenderer
+# save_obj_with_heatmap은 RENDER 모드에서 renderer.render_frame으로 대체됨
+from utils.metrics_logger import MetricsLogger # 성능 측정 로거
+
+# ============================================================
+# [실험 모드 설정]
+# "RENDER": 시각화 이미지 저장 (기존의 [B] 시각화용 OBJ 저장 역할 대체)
+# "BENCHMARK": 렌더링 없이 FPS/성능 측정 및 CSV 저장 (성능 검증용)
+# ============================================================
+# EXP_MODE = "RENDER"
+EXP_MODE = "BENCHMARK"
+# ============================================================
+
+# 1. 환경 설정 (기존 main_data_collection의 설정 계승)
+SIZE = 1024
+WIDTH = SIZE
+HEIGHT = SIZE
+PHYSICAL_WIDTH = 12.0 # 기존 설정 유지
+
+# 2. 시간 설정
+DT = 0.01
+SUBSTEPS = 15
+TOTAL_FRAMES = 5000 # 기존 설정 유지 (충분한 데이터 확보)
+
+# 실험 이름 설정 (저장 폴더명 등으로 사용)
+if EXP_MODE == "RENDER":
+    EXP_NAME = f"view_culling_v1_render_{SIZE}" # 기존 저장 폴더명 반영
+elif EXP_MODE == "BENCHMARK":
+    EXP_NAME = f"view_culling_v1_bench_{SIZE}"
+
+print(f"=== Cloth Simulation: Data Collection & Benchmark ===")
+print(f"Mode: {EXP_MODE} | Resolution: {WIDTH}x{HEIGHT}")
+print(f"Physical Width: {PHYSICAL_WIDTH}m | Substeps: {SUBSTEPS}")
+print(f"Total Frames: {TOTAL_FRAMES}")
+print(f"Experiment Name: {EXP_NAME}")
+print("=====================================================")
+
+# 디렉토리 설정
+BASE_DIR = os.path.join(current_dir, f"experiment_results/{EXP_NAME}")
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# 3. 모듈 초기화
+print("🎓 Initialize Simulation...")
+sim = ClothSimulator(WIDTH, HEIGHT, physical_width=PHYSICAL_WIDTH, dt=DT, substeps=SUBSTEPS)
+
+renderer = None
+logger = None
+
+if EXP_MODE == "RENDER":
+    # 렌더링 모드: Renderer 초기화 (기존 ClothRenderer 사용)
+    RENDER_DIR = os.path.join(BASE_DIR, "frames")
+    print(RENDER_DIR)
+    # 기존 코드의 save_dir="view_culling_v1"을 RENDER_DIR로 대체
+    renderer = ClothRenderer(WIDTH, HEIGHT, save_dir=RENDER_DIR)
+    print(f"[Info] Renderer initialized. Saving frames to: {RENDER_DIR}")
+
+    TOTAL_FRAMES = 2500
+
+elif EXP_MODE == "BENCHMARK":
+    # 벤치마크 모드: Logger 초기화
+    LOG_DIR = os.path.join(BASE_DIR, "logs")
+    logger = MetricsLogger(save_dir=LOG_DIR, exp_name=EXP_NAME)
+    print(f"[Info] Benchmark Logger initialized. Saving logs to: {LOG_DIR}")
+
+    TOTAL_FRAMES = 500
+
+
+# ============================================================
+# Main Simulation Loop
+# ============================================================
+print(f"Start simulation loop...")
+loop_range = tqdm(range(TOTAL_FRAMES), desc=f"Simulating ({EXP_MODE})")
+
+for frame in loop_range:
+    
+    # [BENCHMARK] 프레임 시작 시간 기록
+    if EXP_MODE == "BENCHMARK":
+        logger.start_frame()
+
+    # ---------------------------------------------------------
+    # [Physics Step] 물리 시뮬레이션 수행
+    # ---------------------------------------------------------
+    phys_start = time.perf_counter()
+    sim.step()
+    phys_end = time.perf_counter()
+    frame_physics_time = phys_end - phys_start
+
+    # ---------------------------------------------------------
+    # [Data Retrieval] GPU -> CPU 데이터 가져오기 (중요)
+    # ---------------------------------------------------------
+    # RENDER 모드에서는 시각화에, BENCHMARK 모드에서는 통계 계산에 사용됨
+    # ClothSimulator에 해당 메서드들이 구현되어 있어야 함
+    pos = sim.get_positions()           # (N, 3)
+    
+    # NOTE: vel, geo_feature는 현재 RENDER/BENCHMARK 모드에서 직접 사용되지 않지만,
+    # 추후 [A] AI 학습용 데이터 저장 기능 부활 시 필요함.
+    # vel = sim.get_velocities()        # (N, 3)
+    # geo_feature = sim.get_compression_feature(pos) # (N, 1)
+    
+    penetration = sim.get_penetration_depth() # (N,) : 정답 라벨/통계용
+
+    # ---------------------------------------------------------
+    # 모드별 동작 분기
+    # ---------------------------------------------------------
+    if EXP_MODE == "RENDER":
+        # [RENDER MODE] 이미지 저장 (기존 [B] 시각화용 OBJ 저장 대체)
         
-        # 1. Vertices (v x y z r g b) - 히트맵 컬러 포함
-        for i, v in enumerate(vertices):
-            depth = penetrations[i]
-            
-            ratio = 0.0
-            if depth > ignore_threshold:
-                ratio = (depth - ignore_threshold) / (critical_threshold - ignore_threshold)
-                ratio = min(max(ratio, 0.0), 1.0)
-            
-            r, g, b = 1.0, 1.0 - ratio, 1.0 - ratio
-            # Blender는 OBJ의 Vertex Color를 지원함 (속성에서 확인 가능)
-            f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {r:.4f} {g:.4f} {b:.4f}\n")
-
-        # 2. UV Coordinates (vt u v) - [NEW] 텍스처 좌표 생성
-        # 격자 형태이므로 0~1 사이 값으로 정규화하여 생성
-        for y in range(height):
-            for x in range(width):
-                u = x / (width - 1)
-                v = y / (height - 1)
-                f.write(f"vt {u:.4f} {v:.4f}\n")
-
-        # 3. Faces (f v1/vt1 v2/vt2 v3/vt3) - [NEW] 좌표 인덱스 연결
-        for y in range(height - 1):
-            for x in range(width - 1):
-                # OBJ는 인덱스가 1부터 시작함
-                # 현재 버텍스 순서와 UV 순서가 동일하게 생성되었으므로 인덱스를 같이 씀
-                
-                # Quad를 두 개의 Triangle로 나눔
-                # (x, y), (x+1, y), (x, y+1), (x+1, y+1)
-                
-                idx_bl = (y * width + x) + 1       # Bottom-Left
-                idx_br = (y * width + x + 1) + 1   # Bottom-Right
-                idx_tl = ((y + 1) * width + x) + 1 # Top-Left
-                idx_tr = ((y + 1) * width + x + 1) + 1 # Top-Right
-                
-                # Triangle 1 (BL - BR - TR) -> 반시계 방향 주의
-                # f v/vt v/vt v/vt
-                f.write(f"f {idx_bl}/{idx_bl} {idx_br}/{idx_br} {idx_tr}/{idx_tr}\n")
-                
-                # Triangle 2 (BL - TR - TL)
-                f.write(f"f {idx_bl}/{idx_bl} {idx_tr}/{idx_tr} {idx_tl}/{idx_tl}\n")
-
-def main_data_collection():
-    print("🎓 Initialize Simulation for Ground Truth Collection...")
-
-    SIZE = 256
-    sim = ClothSimulator(SIZE, SIZE, physical_width=12.0, dt=0.01, substeps=17)
-
-    # 1. 학습 데이터셋 저장 폴더 (NPZ)
-    dataset_dir = "dataset_flag_128"
-    os.makedirs(dataset_dir, exist_ok=True)
-
-    # 2. 시각화 확인용 폴더 (OBJ)
-    vis_dir = "test_3"
-    os.makedirs(vis_dir, exist_ok=True)
-
-    total_frames = 5000 # 충분한 데이터 확보를 위해 2000 프레임 권장
-    print(f"Start simulation for {total_frames} frames...")
-
-    renderer = ClothRenderer(SIZE, SIZE, save_dir="xpbd_256_thick")
-
-    for frame in tqdm(range(total_frames), desc="Collecting Data"):
-        sim.step()
-
-        # ---------------------------------------------------------
-        # [중요] GPU -> CPU 데이터 가져오기
-        # ---------------------------------------------------------
-        # ClothSimulator 클래스에 get_velocities()가 구현되어 있어야 합니다.
-        # (만약 없다면 d_vel.copy_to_host()를 리턴하는 함수를 추가하세요)
-        
-        pos = sim.get_positions()           # (N, 3) : 위치
-        vel = sim.get_velocities()          # (N, 3) : 속도 [Input Feature]
-        
-        # 이름이 get_penetration_depths()인지 get_penetration_depth()인지 확인 필요
-        # (이전 코드 맥락상 get_penetration_depths 일 가능성이 높음)
-        penetration = sim.get_penetration_depth() # (N,) : 정답 라벨 [Ground Truth]
-
-        # 기하학적 특성 추출
-        geo_feature = sim.get_compression_feature(pos) # (N, 1)
-
-        # # ---------------------------------------------------------
-        # # [A] AI 학습용 데이터 저장 (.npz) - 매 프레임 저장 권장
-        # # ---------------------------------------------------------
-        # # 움직임의 연속성을 학습하려면 매 프레임 저장하는 것이 좋습니다.
-        # save_path = os.path.join(dataset_dir, f"data_{frame:04d}.npz")
-        
-        # np.savez_compressed(
-        #     save_path,
-        #     pos=pos,    # 나중에 곡률(Curvature) 계산용
-        #     vel=vel,    # 입력 피처 (속도가 빠르면 충돌 위험 Up)
-        #     geo=geo_feature, # 기하학적 특성
-        #     label=penetration # 정답 (0보다 크면 충돌 지역)
-        # )
-        # ---------------------------------------------------------
-        # [B] 시각화용 OBJ 저장 (10프레임마다) - 눈으로 확인용
-        # ---------------------------------------------------------
+        # 5프레임마다 저장 (기존 로직 유지)
         if frame % 5 == 0:
-            # save_obj_with_heatmap(
-            #     f"{vis_dir}/cloth_{frame:03d}.obj",
-            #     pos,
-            #     penetration,
-            #     width, height,
-            #     sim.thickness
-            # )
-            sphere_params=sim.sphere_params.copy_to_host()
+            sphere_params = sim.sphere_params.copy_to_host()
+            
             renderer.render_frame(
                 pos, 
-                penetration, # 여기에 시각화하고 싶은 값을 넣게 (Strain, Velocity 등)
+                penetration, # 히트맵 데이터 (mode='visual'에서는 무시됨)
                 frame,
-                mode='visual',
-                sphere_params = sphere_params
+                mode='visual', # 단색 렌더링 모드
+                sphere_params=sphere_params
             )
 
-    print(f"✅ Data Collection Finished! Saved to {dataset_dir}/")
+    elif EXP_MODE == "BENCHMARK":
+        # [BENCHMARK MODE] 성능 지표 기록
+        
+        # 통계 계산
+        max_pen = np.max(penetration)
+        avg_pen = np.mean(penetration)
+        # 활성 충돌 파티클 수 (침투 깊이가 0보다 큰 경우)
+        active_collisions = np.count_nonzero(penetration > 1e-6)
 
-if __name__ == "__main__":
-    main_data_collection()
+        # 로그 기록
+        # TODO: collision_time을 정확히 측정하려면 ClothSimulator 내부 수정 필요.
+        # 현재는 전체 physics_time을 넘김.
+        fps = logger.log_frame(
+            frame_idx=frame,
+            collision_time=frame_physics_time, 
+            max_pen=max_pen,
+            avg_pen=avg_pen,
+            active_col_count=active_collisions
+        )
+        
+        # 진행바에 정보 표시
+        # frame_physics_time(초 단위)에 1000을 곱해 ms 단위로 표시
+        loop_range.set_postfix({
+            "Total FPS": f"{fps:.1f}", 
+            "MaxPen": f"{max_pen*100:.2f}cm", 
+            "Simulation Time": f"{frame_physics_time * 1000:.2f}ms"
+        })
+
+    # ---------------------------------------------------------
+    # [TODO: A] AI 학습용 데이터 저장 (.npz)
+    # ---------------------------------------------------------
+    # 필요 시 여기에 np.savez_compressed 코드 추가 (이전 코드 참조)
+
+
+# ============================================================
+# 실험 종료
+# ============================================================
+cuda.synchronize()
+print(f"\n✅ Simulation Finished!! : {EXP_NAME}")
+if EXP_MODE == "RENDER":
+    print(f"Frames saved in: {renderer.save_dir}")
+elif EXP_MODE == "BENCHMARK":
+    print(f"Metrics saved in: {logger.filepath}")
