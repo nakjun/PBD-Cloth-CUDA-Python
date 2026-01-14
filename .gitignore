@@ -10,4 +10,4 @@ venv
 dataset_*/
 test*
 xpbd*
-x
+experiment_results/*
