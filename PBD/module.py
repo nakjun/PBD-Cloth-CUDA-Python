@@ -183,30 +183,30 @@ def solve_distance_constraint_colored_kernel(pos_pred, mass_inv, constraints, re
 HASH_TABLE_SIZE = 1000003  # 해시 테이블 크기 (충분히 크게)
 CELL_SIZE = 0.1          # 격자 크기 (파티클 간격과 비슷하거나 약간 크게)
 
-@cuda.jit
-def compute_hash_kernel(pos, particle_hashes, particle_indices, num_particles):
-    """
-    각 파티클이 속한 Grid Cell의 Hash 값을 계산
-    """
-    idx = cuda.grid(1)
-    if idx < num_particles:
-        # 위치 가져오기
-        x = pos[idx, 0]
-        y = pos[idx, 1]
-        z = pos[idx, 2]
+# @cuda.jit
+# def compute_hash_kernel(pos, particle_hashes, particle_indices, num_particles):
+#     """
+#     각 파티클이 속한 Grid Cell의 Hash 값을 계산
+#     """
+#     idx = cuda.grid(1)
+#     if idx < num_particles:
+#         # 위치 가져오기
+#         x = pos[idx, 0]
+#         y = pos[idx, 1]
+#         z = pos[idx, 2]
         
-        # Grid 좌표 계산 (양수로 변환하여 처리)
-        grid_x = int(math.floor(x / CELL_SIZE))
-        grid_y = int(math.floor(y / CELL_SIZE))
-        grid_z = int(math.floor(z / CELL_SIZE))
+#         # Grid 좌표 계산 (양수로 변환하여 처리)
+#         grid_x = int(math.floor(x / CELL_SIZE))
+#         grid_y = int(math.floor(y / CELL_SIZE))
+#         grid_z = int(math.floor(z / CELL_SIZE))
         
-        # Spatial Hash Function (Large Primes)
-        # (x * p1 ^ y * p2 ^ z * p3) % table_size
-        h = (grid_x * 73856093) ^ (grid_y * 19349663) ^ (grid_z * 83492791)
-        h = h % HASH_TABLE_SIZE
+#         # Spatial Hash Function (Large Primes)
+#         # (x * p1 ^ y * p2 ^ z * p3) % table_size
+#         h = (grid_x * 73856093) ^ (grid_y * 19349663) ^ (grid_z * 83492791)
+#         h = h % HASH_TABLE_SIZE
         
-        particle_hashes[idx] = h
-        particle_indices[idx] = idx
+#         particle_hashes[idx] = h
+#         particle_indices[idx] = idx
 
 @cuda.jit
 def find_cell_start_end_kernel(particle_hashes, cell_start, cell_end, num_particles):
@@ -230,48 +230,43 @@ def find_cell_start_end_kernel(particle_hashes, cell_start, cell_end, num_partic
         if idx == num_particles - 1:
             cell_end[hash_val] = idx + 1
 
+import math
+from numba import cuda, float32, int32
+import numpy as np
+
+# ... ( compute_face_normals 등 다른 커널들은 기존 유지 ) ...
+
 @cuda.jit
 def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv, 
                                          cell_start, cell_end, 
                                          sorted_indices, particle_hashes, 
                                          num_particles, thickness, 
                                          penetration_buffer, dt,
-                                         # [NEW] 추가된 인자들
-                                         visibility, frame_idx): 
+                                         visibility, frame_idx, debug_skip_count): 
     """
-    [Novelty Update] View-Dependent Culling 적용
-    visibility 버퍼 값을 확인하여 뒷면(Back-facing) 파티클은 확률적으로 충돌 검사를 건너뜁니다.
+    [Sorted-based Spatial Hashing] + [Physics-based Early Termination] + [Conservative Culling]
+    물리 기반 조기 종료 최적화를 적용하고, 컬링 파라미터를 안정적인 값으로 되돌립니다.
     """
     idx = cuda.grid(1)
     if idx >= num_particles: return
 
     # ============================================================
-    # [NOVELTY LOGIC START] View-Dependent Stochastic Culling
+    # 1. [Novelty] View-Dependent Culling (안정성 복구)
     # ============================================================
+    # 공격적인 파라미터로 인한 퀄리티 저하를 막기 위해 다시 보수적으로 설정합니다.
     vis_score = visibility[idx]
-    
-    # 임계값 설정: 0.2 미만이면 '뒷면' 혹은 '측면 뒤쪽'으로 간주
-    culling_threshold = 0.2 
+    culling_threshold = 0.2  # 0.5 -> 0.2 (뒷면 판단 기준 완화)
 
     if vis_score < culling_threshold:
-        # --- 확률적 스킵 (Stochastic Skipping) ---
-        # 매 프레임, 매 파티클마다 다른 랜덤 값을 생성하기 위한 간단한 해시 함수
-        # (frame_idx가 변하면서 매번 다른 결과가 나옴)
         seed = idx * 12345 + frame_idx * 67897
-        # Linear Congruential Generator (LCG) 방식 난수 생성
         rand_state = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        rand_float = float(rand_state) / 2147483648.0 # 0.0 ~ 1.0 사이 실수
+        rand_float = float(rand_state) / 2147483648.0 
         
-        # 스킵 확률 설정 (예: 70% 확률로 스킵)
-        # 너무 높으면 뚫림이 보이고, 너무 낮으면 성능 이득이 적음
-        skip_probability = 0.7
+        skip_probability = 0.7 # 0.95 -> 0.7 (스킵 확률 감소)
 
         if rand_float < skip_probability:
-            # 🎲 당첨! 이번 프레임 이 파티클은 비싼 충돌 검사를 안 하고 넘어갑니다.
-            # 성능 향상의 핵심 포인트입니다.
-            return 
-    # ============================================================
-    # [NOVELTY LOGIC END]
+            # cuda.atomic.add(debug_skip_count, 0, 1)
+            return
     # ============================================================
     
     w_i = mass_inv[idx]
@@ -281,35 +276,27 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
     py = pos_pred[idx, 1]
     pz = pos_pred[idx, 2]
 
+    # 이전 프레임 위치 (속도 계산용)
     px_old = pos_old[idx, 0]
     py_old = pos_old[idx, 1]
     pz_old = pos_old[idx, 2]
     
-    # CELL_SIZE가 상수로 정의되어 있다고 가정합니다.
-    # 만약 아니라면 인자로 받아야 합니다.
     grid_x = int(math.floor(px / CELL_SIZE))
     grid_y = int(math.floor(py / CELL_SIZE))
     grid_z = int(math.floor(pz / CELL_SIZE))
     
     # --- Parameters ---
-    # 다시 약간 보수적으로 복귀
-    contact_compliance = 0.0001 # 0.001은 너무 물렁해서 깊게 박힘 -> 0.0001로 약간 단단하게
+    contact_compliance = 0.00001 
     alpha_tilde = contact_compliance / (dt * dt)
-
-    friction_mu_k = 0.05 # 마찰은 낮게 유지
+    friction_mu_k = 0.05
     friction_mu_s = 0.05
-    
-    # [Safety Cap] 한 번의 충돌 해결로 움직일 수 있는 최대 거리
-    # thickness의 10%를 넘어가면 비정상적인 힘으로 간주하고 자름
-    max_displacement = thickness * 0.1 
-
+    max_displacement = thickness * 0.2
     max_collisions = 8
     collision_count = 0
-    
     max_depth = 0.0
     stop_search = False
 
-    # Neighbor Search
+    # 2. Neighbor Search
     for z in range(-1, 2):
         if stop_search: break
         for y in range(-1, 2):
@@ -321,7 +308,6 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                 neighbor_y = grid_y + y
                 neighbor_z = grid_z + z
                 
-                # HASH_TABLE_SIZE가 상수로 정의되어 있다고 가정합니다.
                 h = (neighbor_x * 73856093) ^ (neighbor_y * 19349663) ^ (neighbor_z * 83492791)
                 h = h % HASH_TABLE_SIZE
                 
@@ -331,44 +317,69 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
 
                 for k in range(start_idx, end_idx):
                     j = sorted_indices[k]
-                    if idx == j: continue 
                     
+                    # 중복 및 자기 자신 검사 스킵
+                    if idx <= j: continue 
+                    
+                    w_j = mass_inv[j]
+                    if w_i + w_j == 0.0: continue
+
                     jx = pos_pred[j, 0]
                     jy = pos_pred[j, 1]
                     jz = pos_pred[j, 2]
-                    
-                    w_j = mass_inv[j]
-                    w_sum = w_i + w_j
-                    if w_sum == 0.0: continue
 
+                    # 상대 위치 벡터
                     dx = px - jx
                     dy = py - jy
                     dz = pz - jz
                     
-                    dist_sq = dx*dx + dy*dy + dz*dz
-                    min_dist = thickness * 2.0 
+                    # ============================================================
+                    # [핵심 최적화] 물리 기반 조기 종료: 상대 속도 발산 검사
+                    # ============================================================
+                    # 두 파티클이 서로 멀어지는 중이라면 충돌 검사를 아예 수행하지 않습니다.
                     
+                    # i의 변위 벡터 (~속도)
+                    disp_i_x = px - px_old
+                    disp_i_y = py - py_old
+                    disp_i_z = pz - pz_old
+                    # j의 변위 벡터 (~속도)
+                    disp_j_x = jx - pos_old[j, 0]
+                    disp_j_y = jy - pos_old[j, 1]
+                    disp_j_z = jz - pos_old[j, 2]
+                    
+                    # 상대 속도 벡터 (V_rel = V_i - V_j)
+                    rel_vel_x = disp_i_x - disp_j_x
+                    rel_vel_y = disp_i_y - disp_j_y
+                    rel_vel_z = disp_i_z - disp_j_z
+                    
+                    # 내적 (상대 위치 · 상대 속도)
+                    # 결과가 양수면 두 파티클 사이의 거리가 증가하고 있다는 뜻입니다.
+                    dot_v_d = dx * rel_vel_x + dy * rel_vel_y + dz * rel_vel_z
+                    
+                    # 아주 작은 마진(1e-9)을 두고 판단합니다.
+                    if dot_v_d > 1e-9: 
+                        continue # 🚀 조기 종료! 비싼 연산 스킵
+                    # ============================================================
+
+                    dist_sq = dx*dx + dy*dy + dz*dz
+                    min_dist = thickness
+
+                    # 3. 상세 거리 검사 및 충돌 해결
+                    # (이 아래는 상대 속도가 가까워지는 경우에만 실행됩니다)
                     if dist_sq < (min_dist * min_dist) and dist_sq > 1e-12:
                         dist = math.sqrt(dist_sq)
-                        
-                        # [Safety 1] Penetration Cap
-                        # 실제 침투 깊이가 아무리 깊어도, 계산에는 'max_displacement'까지만 사용
-                        # 이렇게 해야 lambda_n이 폭발하지 않음
                         actual_penetration = min_dist - dist
                         penetration = actual_penetration
                         
-                        if penetration > max_displacement:
-                            penetration = max_displacement
-                        
+                        if penetration > max_displacement: penetration = max_displacement
                         if actual_penetration > max_depth: max_depth = actual_penetration
 
                         nx = dx / dist
                         ny = dy / dist
                         nz = dz / dist
                         
-                        # [XPBD Step 1] Normal Solve
-                        lambda_n = penetration / (w_sum + alpha_tilde)
-                        
+                        # --- XPBD Position Correction ---
+                        lambda_n = penetration / ((w_i + w_j) + alpha_tilde)
                         dx_n = nx * lambda_n * w_i
                         dy_n = ny * lambda_n * w_i
                         dz_n = nz * lambda_n * w_i
@@ -377,51 +388,29 @@ def solve_self_collision_friction_kernel(pos_pred, pos_old, mass_inv,
                         cuda.atomic.add(pos_pred, (idx, 1), dy_n)
                         cuda.atomic.add(pos_pred, (idx, 2), dz_n)
                         
-                        # [XPBD Step 2] Friction
-                        jx_old = pos_old[j, 0]
-                        jy_old = pos_old[j, 1]
-                        jz_old = pos_old[j, 2]
-                        
-                        disp_i_x = (px - px_old)
-                        disp_i_y = (py - py_old)
-                        disp_i_z = (pz - pz_old)
-                        
-                        disp_j_x = (jx - jx_old)
-                        disp_j_y = (jy - jy_old)
-                        disp_j_z = (jz - jz_old)
-                        
-                        rel_x = disp_i_x - disp_j_x
-                        rel_y = disp_i_y - disp_j_y
-                        rel_z = disp_i_z - disp_j_z
-                        
-                        dot_n = rel_x*nx + rel_y*ny + rel_z*nz
-                        tan_x = rel_x - dot_n*nx
-                        tan_y = rel_y - dot_n*ny
-                        tan_z = rel_z - dot_n*nz
-                        
+                        # --- XPBD Friction ---
+                        dot_n = rel_vel_x*nx + rel_vel_y*ny + rel_vel_z*nz
+                        tan_x = rel_vel_x - dot_n*nx
+                        tan_y = rel_vel_y - dot_n*ny
+                        tan_z = rel_vel_z - dot_n*nz
                         tan_len = math.sqrt(tan_x*tan_x + tan_y*tan_y + tan_z*tan_z)
                         
-                        if tan_len > 1e-6:
+                        if tan_len > 1e-9:
                             tx = tan_x / tan_len
                             ty = tan_y / tan_len
                             tz = tan_z / tan_len
                             
-                            limit = friction_mu_k * lambda_n
                             friction_lambda = 0.0
-                            
-                            if tan_len < (friction_mu_s * lambda_n * w_sum): 
-                                friction_lambda = tan_len / w_sum
+                            if tan_len < (friction_mu_s * lambda_n * (w_i + w_j)): 
+                                friction_lambda = tan_len / (w_i + w_j)
                             else:
-                                friction_lambda = limit
+                                friction_lambda = friction_mu_k * lambda_n
                             
-                            # [Safety 2] Friction Displacement Cap
-                            # 마찰 이동량이 너무 크면 강제로 자름 (폭발 방지의 핵심)
                             friction_disp = friction_lambda * w_i
                             if friction_disp > max_displacement:
-                                friction_lambda = max_displacement / w_i # 역산해서 제한
+                                friction_lambda = max_displacement / w_i
                             
                             scale = friction_lambda * w_i
-                            
                             cuda.atomic.add(pos_pred, (idx, 0), -tx * scale)
                             cuda.atomic.add(pos_pred, (idx, 1), -ty * scale)
                             cuda.atomic.add(pos_pred, (idx, 2), -tz * scale)
@@ -848,3 +837,110 @@ def compute_visibility_kernel(pos, faces, normals, visibility, cam_pos, num_face
         else:
             # 법선 계산이 불가능한 경우(예: 고립된 점)는 보인다고 가정
             visibility[p_idx] = 1.0
+
+@cuda.jit
+def clear_counter_kernel(counter_array):
+    """
+    디버그 카운터 배열의 첫 번째 요소를 0으로 초기화합니다.
+    (스레드 하나만 실행하면 됩니다)
+    """
+    idx = cuda.grid(1)
+    if idx == 0:
+        counter_array[0] = 0
+
+@cuda.jit
+def compute_curvature_kernel(pos, curvature_out, num_x, num_y):
+    """
+    [신규 추가] 이산 라플라시안을 이용한 곡률 근사 계산
+    curvature = || p_avg - p_center ||
+    """
+    # 2D Grid 인덱싱 (Structured Grid의 이점 활용)
+    ix, iy = cuda.grid(2)
+    
+    if ix >= num_x or iy >= num_y:
+        return
+
+    idx = iy * num_x + ix
+
+    # 경계(Boundary)에 있는 파티클은 곡률 계산에서 제외하거나 0으로 처리
+    if ix == 0 or ix == num_x - 1 or iy == 0 or iy == num_y - 1:
+        curvature_out[idx] = 0.0
+        return
+
+    # 중심점 위치
+    cx, cy, cz = pos[idx, 0], pos[idx, 1], pos[idx, 2]
+
+    # 상하좌우 이웃 (Von Neumann Neighborhood)
+    # Left (ix-1, iy)
+    l_idx = iy * num_x + (ix - 1)
+    lx, ly, lz = pos[l_idx, 0], pos[l_idx, 1], pos[l_idx, 2]
+
+    # Right (ix+1, iy)
+    r_idx = iy * num_x + (ix + 1)
+    rx, ry, rz = pos[r_idx, 0], pos[r_idx, 1], pos[r_idx, 2]
+
+    # Up (ix, iy-1)
+    u_idx = (iy - 1) * num_x + ix
+    ux, uy, uz = pos[u_idx, 0], pos[u_idx, 1], pos[u_idx, 2]
+
+    # Down (ix, iy+1)
+    d_idx = (iy + 1) * num_x + ix
+    dx, dy, dz = pos[d_idx, 0], pos[d_idx, 1], pos[d_idx, 2]
+
+    # 이웃들의 평균 위치 계산
+    avg_x = (lx + rx + ux + dx) * 0.25
+    avg_y = (ly + ry + uy + dy) * 0.25
+    avg_z = (lz + rz + uz + dz) * 0.25
+
+    # 라플라시안 벡터 (Average - Center)
+    diff_x = avg_x - cx
+    diff_y = avg_y - cy
+    diff_z = avg_z - cz
+
+    # 벡터의 크기(Magnitude)가 곧 곡률의 척도
+    curv = math.sqrt(diff_x*diff_x + diff_y*diff_y + diff_z*diff_z)
+    
+    curvature_out[idx] = curv
+
+@cuda.jit
+def compute_hash_kernel_v2(pos, hashes, particle_indices, cell_start, cell_end, 
+                        curvature, curvature_threshold,
+                        num_particles, cell_size, hash_table_size):
+    """
+    [수정됨] 곡률 Culling + 인덱스 초기화 포함
+    - hashes: 해시값 저장용 (구 grid_particle_indices)
+    - particle_indices: 파티클 ID 저장용 (정렬을 위해 필수)
+    """
+    idx = cuda.grid(1)
+    if idx >= num_particles:
+        return
+
+    # [중요] 매 프레임 정렬을 위해 자신의 ID를 기록 (0, 1, 2...)
+    particle_indices[idx] = idx
+
+    # --- [Culling Logic] ---
+    if curvature[idx] < curvature_threshold:
+        # Culling 된 파티클은 해시값을 무효값(-1)으로 설정하되,
+        # 인덱스는 유지해야 함 (나중에 복원 불필요하지만 안전하게)
+        hashes[idx] = -1 
+        return
+
+    # --- [Hashing Logic] ---
+    px = pos[idx, 0]
+    py = pos[idx, 1]
+    pz = pos[idx, 2]
+
+    cell_x = int(math.floor(px / cell_size))
+    cell_y = int(math.floor(py / cell_size))
+    cell_z = int(math.floor(pz / cell_size))
+
+    p1 = 73856093
+    p2 = 19349663
+    p3 = 83492791
+    
+    hash_val = ((cell_x * p1) ^ (cell_y * p2) ^ (cell_z * p3)) % hash_table_size
+    if hash_val < 0: 
+        hash_val += hash_table_size
+
+    # 결과 저장
+    hashes[idx] = hash_val

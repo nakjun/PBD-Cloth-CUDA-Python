@@ -3,10 +3,12 @@ import numpy as np
 from numba import cuda
 from PBD.module import predict_position_kernel, update_velocity_kernel
 from PBD.module import solve_distance_constraint_colored_kernel
-from PBD.module import compute_hash_kernel, find_cell_start_end_kernel, solve_self_collision_friction_kernel, apply_aerodynamics_kernel,solve_environment_collision_kernel
+from PBD.module import (find_cell_start_end_kernel, 
+                        solve_self_collision_friction_kernel, apply_aerodynamics_kernel,
+                        solve_environment_collision_kernel, clear_counter_kernel, compute_curvature_kernel,compute_hash_kernel_v2)
 from PBD.coloring import compute_graph_coloring
 import math
-
+import time # <--- 필수 추가
 HASH_TABLE_SIZE = 1000003  # 해시 테이블 크기 (충분히 크게)
 CELL_SIZE = 0.1          # 격자 크기 (파티클 간격과 비슷하거나 약간 크게)
 
@@ -185,6 +187,18 @@ class ClothSimulator:
         self.threads_per_block = 256
         self.blocks_particles = (self.num_particles + self.threads_per_block - 1) // self.threads_per_block
 
+        self.threads_per_block_2d = (16, 16)
+        self.blocks_per_grid_x = int(np.ceil(self.num_x / 16))
+        self.blocks_per_grid_y = int(np.ceil(self.num_y / 16))
+        self.blocks_per_grid_2d = (self.blocks_per_grid_x, self.blocks_per_grid_y)
+
+        self.d_debug_skip_count = cuda.to_device(np.array([0], dtype=np.int32))
+        self.last_sort_time = 0.0 # [NEW] 마지막 프레임의 정렬 시간 저장
+
+        # 곡률 기반 컬링
+        self.d_curvature = cuda.device_array(self.num_particles, dtype=np.float32)
+        self.curvature_threshold = 0.002
+
 # ---------------------------------------------------------
         # [GPU Memory Usage Info] 초기화 후 메모리 사용량 출력
         # ---------------------------------------------------------
@@ -217,50 +231,47 @@ class ClothSimulator:
             print(f"[Warning] Failed to get GPU memory info: {e}")
 
     def _sort_particles_torch(self):
-        """
-        [Professor's Refinement] PyTorch를 이용한 고속 정렬
-        Numba Device Array <-> PyTorch Tensor 간의 Zero-Copy 변환을 수행합니다.
-        """
-        # 1. Numba -> PyTorch (Zero-Copy View 생성)
-        # __cuda_array_interface__를 통해 GPU 메모리 주소를 공유합니다.
-        ctx = cuda.current_context()
-        
-        # Numba 배열의 포인터를 PyTorch가 이해하도록 변환
+        # 1. [Sync Numba] 시작 전 대기
+        cuda.synchronize()
+
+        # 타이머 시작 (여기서부터 정렬 단계로 간주)
+        t_start = time.perf_counter() 
+
+        # --- PyTorch 영역 ---
         hashes_torch = torch.as_tensor(self.d_particle_hashes, device='cuda')
         indices_torch = torch.as_tensor(self.d_particle_indices, device='cuda')
         
-        # 2. PyTorch의 강력한 Radix Sort 수행
-        # stable=True는 같은 해시값을 가진 파티클들의 순서를 유지해줌 (물리적 안정성에 도움)
         sorted_indices = torch.argsort(hashes_torch, descending=False, stable=True)
         
-        # 3. 정렬된 결과로 재배치 (Fancy Indexing - 여기서 VRAM 복사 발생)
-        # 하지만 C++ 레벨에서 최적화된 커널이 돌기 때문에 매우 빠름
-        hashes_sorted = hashes_torch[sorted_indices]
-        indices_sorted = indices_torch[sorted_indices]
+        hashes_sorted = hashes_torch[sorted_indices].contiguous()
+        indices_sorted = indices_torch[sorted_indices].contiguous()
         
-        # 4. PyTorch -> Numba (데이터 덮어쓰기)
-        # PyTorch 텐서의 __cuda_array_interface__를 Numba가 읽어서 복사
-        # contiguous()는 메모리가 연속적인지 확인하는 안전장치
-        
-        # 방법 A: copy_to_device (명시적)
-        # self.d_particle_hashes.copy_to_device(cuda.as_cuda_array(hashes_sorted))
-        
-        # 방법 B: Direct Copy (추천)
-        # Numba device array에 다른 CUDA array 인터페이스 객체를 넣으면 D2D 복사가 일어남
-        
-        # [주의] PyTorch 텐서를 바로 Numba array에 할당할 수 없으므로,
-        # 아래와 같이 CUDA Interface를 통해 값을 복사해야 함.
-        
-        # 4-1. PyTorch Tensor -> Numba Device Array View
+        # [Sync PyTorch] PyTorch 작업 완료 대기
+        torch.cuda.synchronize()
+        # --- PyTorch 영역 끝 ---
+
+        # 3. PyTorch -> Numba (데이터 덮어쓰기)
+        # 이 작업들도 정렬 시간에 포함되어야 합니다.
         sorted_hashes_cuda = cuda.as_cuda_array(hashes_sorted)
         sorted_indices_cuda = cuda.as_cuda_array(indices_sorted)
         
-        # 4-2. 원본 버퍼에 복사 (Device to Device Copy)
+        # 비동기 복사 명령 내림
         self.d_particle_hashes.copy_to_device(sorted_hashes_cuda)
         self.d_particle_indices.copy_to_device(sorted_indices_cuda)
 
-    def step(self):
+        # ==================================================================
+        # [핵심 수정] 마지막 Numba 복사 작업이 끝날 때까지 기다려야 합니다.
+        # ==================================================================
+        cuda.synchronize() # Numba 스트림 완료 대기
 
+        # 타이머 종료 (모든 데이터 이동이 완료된 후 측정)
+        t_end = time.perf_counter()
+
+        # 걸린 시간 저장 (단위: 초)
+        self.last_sort_time = t_end - t_start
+
+    def step(self):
+        # clear_counter_kernel[1, 1](self.d_debug_skip_count)
         target_compliance = 0.0       # 완전 딱딱함 (비신축성, 실크/면)
         # target_compliance = 0.00001   # 아주 약간 늘어남 (나일론)
         # target_compliance = 0.005     # 고무줄/스판덱스
@@ -334,9 +345,28 @@ class ClothSimulator:
             self.d_cell_end[:] = -1
             self.d_penetration[:] = 0.0
 
+            threads_1d = 256
+            blocks_1d = int(math.ceil(self.num_particles / threads_1d))
+
+            compute_curvature_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                self.d_pos, 
+                self.d_curvature, 
+                self.num_x, 
+                self.num_y
+            )
+
             # 3-2. Compute Hash
-            compute_hash_kernel[self.blocks_particles, self.threads_per_block](
-                self.d_pos_pred, self.d_particle_hashes, self.d_particle_indices, self.num_particles
+            compute_hash_kernel_v2[blocks_1d, threads_1d](
+                self.d_pos_pred,             # 1. 위치
+                self.d_particle_hashes,      # 2. 해시값 저장소 (이름 수정됨!)
+                self.d_particle_indices,     # 3. [추가됨] 파티클 ID 저장소 (정렬용)
+                self.d_cell_start,           # 4. (Dummy)
+                self.d_cell_end,             # 5. (Dummy)
+                self.d_curvature,            # 6. 곡률
+                self.curvature_threshold,    # 7. 임계값
+                self.num_particles,          # 8. 파티클 수
+                CELL_SIZE,                   # 9. 셀 크기
+                HASH_TABLE_SIZE              # 10. 해시 테이블 크기
             )
 
             # 3-3. Sort Particles (PyTorch Radix Sort - Zero Copy)
@@ -356,7 +386,8 @@ class ClothSimulator:
                 self.d_particle_indices, self.d_particle_hashes, 
                 self.num_particles, self.thickness, self.d_penetration,
                 dt_sub,
-                self.d_visibility, self.frame_count
+                self.d_visibility, self.frame_count,
+                self.d_debug_skip_count
             )
 
             # ------------------------------------------------------------------
@@ -366,6 +397,10 @@ class ClothSimulator:
             update_velocity_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_pos, self.d_vel, self.d_pos_pred, dt_sub, self.num_particles
             )
+
+        # skipped = self.d_debug_skip_count.copy_to_host()[0]
+        # total = self.num_particles * self.substeps
+        # print(f"   [DEBUG] Skipped Collisions: {skipped} / {total} ({skipped/total*100:.1f}%)")
 
     def get_positions(self):
         return self.d_pos.copy_to_host()

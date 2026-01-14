@@ -42,7 +42,7 @@ class MetricsLogger:
         
         fps = 1.0 / total_time if total_time > 0 else 0
         physics_ms = total_time * 1000
-        collision_ms = collision_time * 1000
+        collision_ms = collision_time
         
         row = [
             frame_idx,

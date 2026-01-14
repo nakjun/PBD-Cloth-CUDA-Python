@@ -4,7 +4,7 @@ import numpy as np
 import math
 import time
 from tqdm import tqdm
-from numba import cuda
+from numba import cuda # [필수] CUDA Event 사용을 위해 필요
 
 # 프로젝트 루트 경로 추가 (모듈 import용)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -15,34 +15,34 @@ if project_root not in sys.path:
 # PBD 모듈 및 유틸리티 import
 from PBD.cloth import ClothSimulator
 from PBD.render_utils import ClothRenderer
-# save_obj_with_heatmap은 RENDER 모드에서 renderer.render_frame으로 대체됨
-from utils.metrics_logger import MetricsLogger # 성능 측정 로거
+from utils.metrics_logger import MetricsLogger
 
 # ============================================================
 # [실험 모드 설정]
-# "RENDER": 시각화 이미지 저장 (기존의 [B] 시각화용 OBJ 저장 역할 대체)
-# "BENCHMARK": 렌더링 없이 FPS/성능 측정 및 CSV 저장 (성능 검증용)
+# "RENDER": 시각화 이미지 저장
+# "BENCHMARK": 렌더링 없이 FPS/성능 측정 (성능 검증용)
 # ============================================================
 # EXP_MODE = "RENDER"
 EXP_MODE = "BENCHMARK"
 # ============================================================
 
-# 1. 환경 설정 (기존 main_data_collection의 설정 계승)
+# 1. 환경 설정
 SIZE = 1024
 WIDTH = SIZE
 HEIGHT = SIZE
-PHYSICAL_WIDTH = 12.0 # 기존 설정 유지
+PHYSICAL_WIDTH = 12.0
 
 # 2. 시간 설정
 DT = 0.01
+# 해상도가 높을수록 substeps를 늘려야 안정적입니다. (예: 512 해상도에서는 15~20 권장)
 SUBSTEPS = 15
-TOTAL_FRAMES = 5000 # 기존 설정 유지 (충분한 데이터 확보)
+TOTAL_FRAMES = 5000
 
-# 실험 이름 설정 (저장 폴더명 등으로 사용)
+# 실험 이름 설정
 if EXP_MODE == "RENDER":
-    EXP_NAME = f"view_culling_v1_render_{SIZE}" # 기존 저장 폴더명 반영
+    EXP_NAME = f"view_culling_v3_render_{SIZE}"
 elif EXP_MODE == "BENCHMARK":
-    EXP_NAME = f"view_culling_v1_bench_{SIZE}"
+    EXP_NAME = f"view_culling_v3_bench_{SIZE}"
 
 print(f"=== Cloth Simulation: Data Collection & Benchmark ===")
 print(f"Mode: {EXP_MODE} | Resolution: {WIDTH}x{HEIGHT}")
@@ -61,118 +61,141 @@ sim = ClothSimulator(WIDTH, HEIGHT, physical_width=PHYSICAL_WIDTH, dt=DT, subste
 
 renderer = None
 logger = None
+# [수정] 정확한 GPU 시간 측정을 위한 CUDA Event 객체 생성
+start_event = None
+stop_event = None
 
 if EXP_MODE == "RENDER":
-    # 렌더링 모드: Renderer 초기화 (기존 ClothRenderer 사용)
     RENDER_DIR = os.path.join(BASE_DIR, "frames")
-    print(RENDER_DIR)
-    # 기존 코드의 save_dir="view_culling_v1"을 RENDER_DIR로 대체
     renderer = ClothRenderer(WIDTH, HEIGHT, save_dir=RENDER_DIR)
     print(f"[Info] Renderer initialized. Saving frames to: {RENDER_DIR}")
-
     TOTAL_FRAMES = 2500
 
 elif EXP_MODE == "BENCHMARK":
-    # 벤치마크 모드: Logger 초기화
     LOG_DIR = os.path.join(BASE_DIR, "logs")
     logger = MetricsLogger(save_dir=LOG_DIR, exp_name=EXP_NAME)
     print(f"[Info] Benchmark Logger initialized. Saving logs to: {LOG_DIR}")
-
-    TOTAL_FRAMES = 500
+    TOTAL_FRAMES = 50
+    
+    # [수정] 벤치마크 모드에서만 이벤트 초기화
+    start_event = cuda.event()
+    stop_event = cuda.event()
 
 
 # ============================================================
 # Main Simulation Loop
 # ============================================================
 print(f"Start simulation loop...")
-loop_range = tqdm(range(TOTAL_FRAMES), desc=f"Simulating ({EXP_MODE})")
+# [수정] tqdm 객체를 변수 pbar에 할당하여 루프 내에서 업데이트 가능하게 함
+pbar = tqdm(range(TOTAL_FRAMES), desc=f"Simulating ({EXP_MODE})")
 
-for frame in loop_range:
+# [수정] 밀리초(ms) 단위로 누적 시간 계산
+total_pure_sim_time_ms = 0.0
+
+# [수정] 루프 변수명을 'frame'으로 통일하고 pbar를 순회
+for frame in pbar:
     
-    # [BENCHMARK] 프레임 시작 시간 기록
     if EXP_MODE == "BENCHMARK":
         logger.start_frame()
 
     # ---------------------------------------------------------
-    # [Physics Step] 물리 시뮬레이션 수행
+    # [Physics Step] 물리 시뮬레이션 수행 및 시간 측정 (핵심 수정)
     # ---------------------------------------------------------
-    phys_start = time.perf_counter()
-    sim.step()
-    phys_end = time.perf_counter()
-    frame_physics_time = phys_end - phys_start
+    frame_total_time_ms = 0.0
+    sort_time_ms = 0.0
+    
+    if EXP_MODE == "BENCHMARK":
+        # [중요] 비동기 GPU 실행을 정확히 측정하기 위해 CUDA Event 사용
+        
+        # 1. 시작 타임스탬프 기록
+        start_event.record()
+        
+        # 2. 커널 실행 (비동기)
+        sim.step()
+        
+        # 3. 종료 타임스탬프 기록
+        stop_event.record()
+        
+        # 4. [핵심] GPU가 stop_event 지점까지 작업을 마칠 때까지 CPU 대기
+        stop_event.synchronize()
+        
+        # 5. 정확한 경과 시간 계산 (단위: 밀리초 ms)
+        frame_total_time_ms = cuda.event_elapsed_time(start_event, stop_event)
+
+        # cloth.py 내부에서 측정된 정렬 시간 가져오기 (초 단위라고 가정하고 ms로 변환)
+        # 만약 cloth.py 내부도 cuda event로 ms를 측정한다면 * 1000을 제거하세요.
+        sort_time_ms = sim.last_sort_time * 1000.0
+        
+        # 순수 물리 계산 시간 = 전체 GPU 시간 - 정렬 시간
+        # (주의: 정렬 방식에 따라 이 계산이 음수가 나오거나 부정확할 수 있음. 
+        # 가장 좋은 건 cloth.py 내부에서 정렬을 제외한 구간만 CUDA Event로 감싸는 것입니다.)
+        pure_sim_time_ms = max(0.0, frame_total_time_ms - sort_time_ms)
+        total_pure_sim_time_ms += pure_sim_time_ms
+        
+    else:
+        # RENDER 모드에서는 정밀한 측정 불필요
+        sim.step()
 
     # ---------------------------------------------------------
-    # [Data Retrieval] GPU -> CPU 데이터 가져오기 (중요)
+    # [Data Retrieval] GPU -> CPU 데이터 가져오기
     # ---------------------------------------------------------
-    # RENDER 모드에서는 시각화에, BENCHMARK 모드에서는 통계 계산에 사용됨
-    # ClothSimulator에 해당 메서드들이 구현되어 있어야 함
-    pos = sim.get_positions()           # (N, 3)
-    
-    # NOTE: vel, geo_feature는 현재 RENDER/BENCHMARK 모드에서 직접 사용되지 않지만,
-    # 추후 [A] AI 학습용 데이터 저장 기능 부활 시 필요함.
-    # vel = sim.get_velocities()        # (N, 3)
-    # geo_feature = sim.get_compression_feature(pos) # (N, 1)
-    
-    penetration = sim.get_penetration_depth() # (N,) : 정답 라벨/통계용
+    pos = sim.get_positions() # (N, 3)
+    penetration = sim.get_penetration_depth() # (N,)
 
     # ---------------------------------------------------------
     # 모드별 동작 분기
     # ---------------------------------------------------------
     if EXP_MODE == "RENDER":
-        # [RENDER MODE] 이미지 저장 (기존 [B] 시각화용 OBJ 저장 대체)
-        
-        # 5프레임마다 저장 (기존 로직 유지)
+        # 5프레임마다 저장
         if frame % 5 == 0:
             sphere_params = sim.sphere_params.copy_to_host()
-            
             renderer.render_frame(
                 pos, 
-                penetration, # 히트맵 데이터 (mode='visual'에서는 무시됨)
+                penetration,
                 frame,
-                mode='visual', # 단색 렌더링 모드
+                mode='visual',
                 sphere_params=sphere_params
             )
 
     elif EXP_MODE == "BENCHMARK":
-        # [BENCHMARK MODE] 성능 지표 기록
-        
         # 통계 계산
         max_pen = np.max(penetration)
         avg_pen = np.mean(penetration)
-        # 활성 충돌 파티클 수 (침투 깊이가 0보다 큰 경우)
         active_collisions = np.count_nonzero(penetration > 1e-6)
 
-        # 로그 기록
-        # TODO: collision_time을 정확히 측정하려면 ClothSimulator 내부 수정 필요.
-        # 현재는 전체 physics_time을 넘김.
-        fps = logger.log_frame(
+        # 로그 기록 (ms 단위 시간 전달)
+        logger.log_frame(
             frame_idx=frame,
-            collision_time=frame_physics_time, 
+            collision_time=frame_total_time_ms, 
             max_pen=max_pen,
             avg_pen=avg_pen,
             active_col_count=active_collisions
         )
         
-        # 진행바에 정보 표시
-        # frame_physics_time(초 단위)에 1000을 곱해 ms 단위로 표시
-        loop_range.set_postfix({
-            "Total FPS": f"{fps:.1f}", 
-            "MaxPen": f"{max_pen*100:.2f}cm", 
-            "Simulation Time": f"{frame_physics_time * 1000:.2f}ms"
-        })
-
-    # ---------------------------------------------------------
-    # [TODO: A] AI 학습용 데이터 저장 (.npz)
-    # ---------------------------------------------------------
-    # 필요 시 여기에 np.savez_compressed 코드 추가 (이전 코드 참조)
-
+        # [수정] FPS 및 상태창 업데이트 로직 개선
+        # 현재까지의 평균 FPS 계산 (ms를 초로 변환)
+        elapsed_seconds = total_pure_sim_time_ms / 1000.0
+        avg_pure_fps = (frame + 1) / elapsed_seconds if elapsed_seconds > 0 else 0
+        
+        # [수정] tqdm 설명창 업데이트 (올바른 변수명 사용)
+        pbar.set_description(
+            f"FPS(Pure Avg)={avg_pure_fps:.1f} | "
+            f"Time(Total)={frame_total_time_ms:.2f}ms | "
+            f"Time(XPBD)={pure_sim_time_ms:.2f}ms | "
+            f"Time(Sort)={sort_time_ms:.2f}ms | "
+            f"MaxPen={max_pen*100:.2f}cm"
+        )
 
 # ============================================================
 # 실험 종료
 # ============================================================
+# 마지막으로 남은 GPU 작업이 있다면 대기
 cuda.synchronize()
 print(f"\n✅ Simulation Finished!! : {EXP_NAME}")
+
 if EXP_MODE == "RENDER":
     print(f"Frames saved in: {renderer.save_dir}")
 elif EXP_MODE == "BENCHMARK":
+    # 최종 결과 저장 (metrics.csv)
+    # logger.save_metrics()
     print(f"Metrics saved in: {logger.filepath}")
