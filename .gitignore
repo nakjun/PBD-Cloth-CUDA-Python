@@ -8,3 +8,8 @@ venv
 *.mkv
 *.npz
 dataset_*/
+test*
+xpbd*
+experiment_results/*
+rendering_results/*
+cloth_render.zip
