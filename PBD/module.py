@@ -944,3 +944,145 @@ def compute_hash_kernel_v2(pos, hashes, particle_indices, cell_start, cell_end,
 
     # 결과 저장
     hashes[idx] = hash_val
+
+
+# =============================================================================
+# [NEW] 시공간 코히어런스 (Spatio-Temporal Coherence) 커널
+# =============================================================================
+
+@cuda.jit
+def compute_update_mask_kernel(
+    pos_current,      # (N, 3) 현재 위치
+    pos_cache,        # (N, 3) 캐시된 위치
+    cache_age,        # (N,)   캐시 나이
+    update_mask,      # (N,)   출력: 갱신 필요 여부
+    motion_threshold, # float  움직임 임계값
+    max_cache_age,    # int    최대 캐시 나이
+    num_x, num_y      # int    그리드 크기
+):
+    """
+    [시공간 코히어런스] 각 파티클에 대해 곡률 재계산이 필요한지 판단
+    - 자기 움직임이 임계값 초과 → 재계산
+    - 이웃 움직임이 임계값 초과 → 재계산
+    - 캐시 나이가 최대치 초과 → 재계산
+    """
+    ix, iy = cuda.grid(2)
+    if ix >= num_x or iy >= num_y:
+        return
+    
+    idx = iy * num_x + ix
+    
+    # 1. 자기 자신의 움직임 계산
+    dx = pos_current[idx, 0] - pos_cache[idx, 0]
+    dy = pos_current[idx, 1] - pos_cache[idx, 1]
+    dz = pos_current[idx, 2] - pos_cache[idx, 2]
+    self_motion = math.sqrt(dx*dx + dy*dy + dz*dz)
+    
+    # 2. 이웃들의 최대 움직임 계산 (경계 체크 포함)
+    max_neighbor_motion = 0.0
+    
+    for dy_offset in range(-1, 2):
+        for dx_offset in range(-1, 2):
+            if dx_offset == 0 and dy_offset == 0:
+                continue
+            
+            nx = ix + dx_offset
+            ny = iy + dy_offset
+            
+            if nx >= 0 and nx < num_x and ny >= 0 and ny < num_y:
+                n_idx = ny * num_x + nx
+                
+                ndx = pos_current[n_idx, 0] - pos_cache[n_idx, 0]
+                ndy = pos_current[n_idx, 1] - pos_cache[n_idx, 1]
+                ndz = pos_current[n_idx, 2] - pos_cache[n_idx, 2]
+                n_motion = math.sqrt(ndx*ndx + ndy*ndy + ndz*ndz)
+                
+                if n_motion > max_neighbor_motion:
+                    max_neighbor_motion = n_motion
+    
+    # 3. 갱신 결정 로직
+    need_update = False
+    
+    # 조건 1: 자기 움직임이 임계값 초과
+    if self_motion > motion_threshold:
+        need_update = True
+    
+    # 조건 2: 이웃 움직임이 임계값 초과 (가중치 적용)
+    elif max_neighbor_motion > motion_threshold * 1.5:
+        need_update = True
+    
+    # 조건 3: 캐시 나이가 최대치 초과
+    elif cache_age[idx] >= max_cache_age:
+        need_update = True
+    
+    update_mask[idx] = need_update
+
+
+@cuda.jit
+def compute_curvature_selective_kernel(
+    pos,              # (N, 3) 현재 위치
+    curvature_out,    # (N,)   출력 곡률
+    curvature_cache,  # (N,)   캐시된 곡률
+    pos_cache,        # (N, 3) 캐시된 위치 (갱신용)
+    cache_age,        # (N,)   캐시 나이
+    update_mask,      # (N,)   갱신 필요 여부
+    num_x, num_y
+):
+    """
+    [시공간 코히어런스] update_mask가 True인 파티클만 곡률을 재계산하고,
+    False인 파티클은 캐시된 값을 사용
+    """
+    ix, iy = cuda.grid(2)
+    if ix >= num_x or iy >= num_y:
+        return
+    
+    idx = iy * num_x + ix
+    
+    # 경계 파티클은 항상 0
+    if ix == 0 or ix == num_x - 1 or iy == 0 or iy == num_y - 1:
+        curvature_out[idx] = 0.0
+        return
+    
+    if update_mask[idx]:
+        # === 곡률 재계산 ===
+        cx, cy, cz = pos[idx, 0], pos[idx, 1], pos[idx, 2]
+        
+        # 4방향 이웃 (Von Neumann)
+        l_idx = iy * num_x + (ix - 1)
+        r_idx = iy * num_x + (ix + 1)
+        u_idx = (iy - 1) * num_x + ix
+        d_idx = (iy + 1) * num_x + ix
+        
+        avg_x = (pos[l_idx, 0] + pos[r_idx, 0] + pos[u_idx, 0] + pos[d_idx, 0]) * 0.25
+        avg_y = (pos[l_idx, 1] + pos[r_idx, 1] + pos[u_idx, 1] + pos[d_idx, 1]) * 0.25
+        avg_z = (pos[l_idx, 2] + pos[r_idx, 2] + pos[u_idx, 2] + pos[d_idx, 2]) * 0.25
+        
+        diff_x = avg_x - cx
+        diff_y = avg_y - cy
+        diff_z = avg_z - cz
+        
+        curv = math.sqrt(diff_x*diff_x + diff_y*diff_y + diff_z*diff_z)
+        
+        # 결과 저장 및 캐시 갱신
+        curvature_out[idx] = curv
+        curvature_cache[idx] = curv
+        pos_cache[idx, 0] = cx
+        pos_cache[idx, 1] = cy
+        pos_cache[idx, 2] = cz
+        cache_age[idx] = 0  # 나이 리셋
+        
+    else:
+        # === 캐시 재사용 ===
+        curvature_out[idx] = curvature_cache[idx]
+        cache_age[idx] += 1  # 나이 증가
+
+
+@cuda.jit
+def count_updates_kernel(update_mask, counter, num_particles):
+    """
+    [디버깅/벤치마크용] GPU Atomic을 사용해 갱신된 파티클 수 카운트
+    """
+    idx = cuda.grid(1)
+    if idx < num_particles:
+        if update_mask[idx]:
+            cuda.atomic.add(counter, 0, 1)

@@ -5,7 +5,8 @@ from PBD.module import predict_position_kernel, update_velocity_kernel
 from PBD.module import solve_distance_constraint_colored_kernel
 from PBD.module import (find_cell_start_end_kernel, 
                         solve_self_collision_friction_kernel, apply_aerodynamics_kernel,
-                        solve_environment_collision_kernel, clear_counter_kernel, compute_curvature_kernel,compute_hash_kernel_v2)
+                        solve_environment_collision_kernel, clear_counter_kernel, compute_curvature_kernel,compute_hash_kernel_v2,
+                        compute_update_mask_kernel, compute_curvature_selective_kernel, count_updates_kernel)
 from PBD.coloring import compute_graph_coloring
 import math
 import time # <--- 필수 추가
@@ -199,6 +200,35 @@ class ClothSimulator:
         self.d_curvature = cuda.device_array(self.num_particles, dtype=np.float32)
         self.curvature_threshold = 0.002
 
+        # =============================================================================
+        # [NEW] 시공간 코히어런스 (Spatio-Temporal Coherence) 버퍼
+        # =============================================================================
+        # 캐시된 곡률 값
+        self.d_curvature_cache = cuda.device_array(self.num_particles, dtype=np.float32)
+        # 캐시 시점의 위치
+        self.d_pos_cache = cuda.to_device(pos_host.copy())
+        # 캐시된 이후 경과한 substep 수
+        self.d_cache_age = cuda.device_array(self.num_particles, dtype=np.int32)
+        # 이번 substep에서 갱신 필요 여부
+        self.d_update_mask = cuda.device_array(self.num_particles, dtype=np.bool_)
+        
+        # 초기화: 첫 프레임은 모두 계산하도록 강제
+        self.d_cache_age[:] = 999
+        self.d_curvature_cache[:] = 0.0
+        
+        # 시공간 코히어런스 파라미터
+        self.motion_threshold = self.spacing * 0.05  # 권장: spacing * 0.03 ~ 0.07
+        self.max_cache_age = 5  # 권장: 4 ~ 6 substeps
+        
+        # 통계/디버깅용 카운터
+        self.d_update_counter = cuda.to_device(np.array([0], dtype=np.int32))
+        self.last_update_ratio = 1.0  # 마지막 프레임의 갱신 비율
+        
+        # 시공간 코히어런스 활성화 플래그
+        self.use_temporal_coherence = True
+        
+        print(f"   -> [NEW] Temporal Coherence: motion_threshold={self.motion_threshold:.6f}, max_cache_age={self.max_cache_age}")
+
 # ---------------------------------------------------------
         # [GPU Memory Usage Info] 초기화 후 메모리 사용량 출력
         # ---------------------------------------------------------
@@ -338,9 +368,9 @@ class ClothSimulator:
                 )
 
             # ------------------------------------------------------------------
-            # [Stage 3] Self-Collision (Spatial Hashing)
+            # [Stage 3] Self-Collision (Spatial Hashing + Temporal Coherence)
             # ------------------------------------------------------------------
-            # 3-1. Reset Grid
+            # 3-0. Reset Grid
             self.d_cell_start[:] = -1 
             self.d_cell_end[:] = -1
             self.d_penetration[:] = 0.0
@@ -348,18 +378,46 @@ class ClothSimulator:
             threads_1d = 256
             blocks_1d = int(math.ceil(self.num_particles / threads_1d))
 
-            compute_curvature_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
-                self.d_pos, 
-                self.d_curvature, 
-                self.num_x, 
-                self.num_y
-            )
+            # =============================================================================
+            # [NEW] 시공간 코히어런스 적용
+            # =============================================================================
+            if self.use_temporal_coherence:
+                # 3-1. 갱신 마스크 계산: 어떤 파티클이 곡률 재계산이 필요한지 판단
+                compute_update_mask_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                    self.d_pos,              # 현재 위치
+                    self.d_pos_cache,        # 캐시된 위치
+                    self.d_cache_age,        # 캐시 나이
+                    self.d_update_mask,      # 출력: 갱신 필요 여부
+                    self.motion_threshold,   # 움직임 임계값
+                    self.max_cache_age,      # 최대 캐시 나이
+                    self.num_x, self.num_y
+                )
+                
+                # 3-2. 선택적 곡률 계산: 필요한 파티클만 재계산, 나머지는 캐시 사용
+                compute_curvature_selective_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                    self.d_pos,              # 현재 위치
+                    self.d_curvature,        # 출력 곡률
+                    self.d_curvature_cache,  # 캐시된 곡률
+                    self.d_pos_cache,        # 캐시된 위치 (갱신용)
+                    self.d_cache_age,        # 캐시 나이
+                    self.d_update_mask,      # 갱신 필요 여부
+                    self.num_x, self.num_y
+                )
+            else:
+                # 기존 방식: 매 substep 전체 재계산
+                compute_curvature_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                    self.d_pos, 
+                    self.d_curvature, 
+                    self.num_x, 
+                    self.num_y
+                )
+            # =============================================================================
 
-            # 3-2. Compute Hash
+            # 3-3. Compute Hash (곡률 기반 컬링 포함)
             compute_hash_kernel_v2[blocks_1d, threads_1d](
                 self.d_pos_pred,             # 1. 위치
-                self.d_particle_hashes,      # 2. 해시값 저장소 (이름 수정됨!)
-                self.d_particle_indices,     # 3. [추가됨] 파티클 ID 저장소 (정렬용)
+                self.d_particle_hashes,      # 2. 해시값 저장소
+                self.d_particle_indices,     # 3. 파티클 ID 저장소 (정렬용)
                 self.d_cell_start,           # 4. (Dummy)
                 self.d_cell_end,             # 5. (Dummy)
                 self.d_curvature,            # 6. 곡률
@@ -410,6 +468,53 @@ class ClothSimulator:
 
     def get_velocities(self):
         return self.d_vel.copy_to_host()
+
+    def get_update_ratio(self):
+        """
+        [시공간 코히어런스 통계] 마지막 substep에서 실제로 갱신된 파티클의 비율을 반환
+        Returns: float (0.0 ~ 1.0)
+        """
+        if not self.use_temporal_coherence:
+            return 1.0
+        
+        # 카운터 리셋
+        self.d_update_counter[:] = 0
+        
+        # 갱신 수 카운트
+        threads_1d = 256
+        blocks_1d = int(math.ceil(self.num_particles / threads_1d))
+        count_updates_kernel[blocks_1d, threads_1d](
+            self.d_update_mask,
+            self.d_update_counter,
+            self.num_particles
+        )
+        
+        update_count = self.d_update_counter.copy_to_host()[0]
+        self.last_update_ratio = update_count / self.num_particles
+        return self.last_update_ratio
+    
+    def get_cache_hit_rate(self):
+        """
+        [시공간 코히어런스 통계] 캐시 히트율 (1 - update_ratio)
+        Returns: float (0.0 ~ 1.0)
+        """
+        return 1.0 - self.get_update_ratio()
+    
+    def set_temporal_coherence(self, enabled, motion_threshold=None, max_cache_age=None):
+        """
+        시공간 코히어런스 설정 변경
+        """
+        self.use_temporal_coherence = enabled
+        if motion_threshold is not None:
+            self.motion_threshold = motion_threshold
+        if max_cache_age is not None:
+            self.max_cache_age = max_cache_age
+        
+        if enabled:
+            # 활성화 시 캐시 강제 리셋
+            self.d_cache_age[:] = 999
+            
+        print(f"[Temporal Coherence] enabled={enabled}, motion_threshold={self.motion_threshold:.6f}, max_cache_age={self.max_cache_age}")
 
     def get_compression_feature(self, positions=None):
         """
