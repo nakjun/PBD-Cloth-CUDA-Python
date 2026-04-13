@@ -27,7 +27,7 @@ EXP_MODE = "BENCHMARK"
 # ============================================================
 
 # 1. 환경 설정
-SIZE = 1024
+SIZE = 256
 WIDTH = SIZE
 HEIGHT = SIZE
 PHYSICAL_WIDTH = 12.0

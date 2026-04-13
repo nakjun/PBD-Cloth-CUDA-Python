@@ -1,0 +1,4 @@
+﻿Size,Config,Num Trials,FPS (mean),FPS (std),FPS (mean±std),Frame Time (mean ms),Frame Time (std ms),Avg Max Pen (cm),Avg Collisions,Avg Active Pairs
+512x512,baseline_spatial_hashing,3,12.79,0.02,12.79±0.02,78.183,0.132,0.0061,0.0,617900.0
+512x512,curvature_culling,3,13.5,0.05,13.50±0.05,74.048,0.252,0.0041,0.0,402550.0
+512x512,full_optimization,3,13.25,0.08,13.25±0.08,75.474,0.432,0.0083,0.1,379100.0

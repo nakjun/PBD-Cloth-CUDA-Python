@@ -5,20 +5,53 @@ from PBD.module import predict_position_kernel, update_velocity_kernel
 from PBD.module import solve_distance_constraint_colored_kernel
 from PBD.module import (find_cell_start_end_kernel, 
                         solve_self_collision_friction_kernel, apply_aerodynamics_kernel,
-                        solve_environment_collision_kernel, clear_counter_kernel, compute_curvature_kernel,compute_hash_kernel_v2,
-                        compute_update_mask_kernel, compute_curvature_selective_kernel, count_updates_kernel)
+                        solve_environment_collision_kernel, clear_counter_kernel, compute_curvature_kernel, compute_hash_kernel_v2,
+                        compute_update_mask_kernel, compute_curvature_selective_kernel, count_updates_kernel,
+                        compute_curvature_tiled_kernel, TILE_SIZE,
+                        fused_curvature_hash_kernel, fused_curvature_hash_tiled_kernel,
+                        fused_temporal_curvature_hash_kernel,
+                        solve_distance_constraint_jacobi_kernel, apply_jacobi_correction_kernel)
 from PBD.coloring import compute_graph_coloring
 import math
-import time # <--- 필수 추가
+import time
+
+# 해시 테이블 상수
 HASH_TABLE_SIZE = 1000003  # 해시 테이블 크기 (충분히 크게)
-CELL_SIZE = 0.1          # 격자 크기 (파티클 간격과 비슷하거나 약간 크게)
+DEFAULT_CELL_SIZE = 0.1   # 기본 격자 크기
+
+def compute_optimal_cell_size(spacing, thickness):
+    """
+    [Phase 2 최적화] 해상도에 따른 최적 셀 크기 계산
+    
+    셀 크기가 너무 작으면: 많은 셀 검색 필요 → 느림
+    셀 크기가 너무 크면: 셀당 파티클 수 증가 → 느림
+    
+    최적: thickness * 2 ~ spacing * 2 사이
+    """
+    # 충돌 검출 거리의 2배 정도가 적당
+    collision_distance = thickness * 2.0
+    
+    # spacing과 collision_distance 중 큰 값의 1.5배
+    optimal = max(collision_distance, spacing) * 1.5
+    
+    # 최소/최대 제한
+    return max(0.05, min(optimal, 0.5))
 
 class ClothSimulator:
-    def __init__(self, width, height, physical_width=10.0, dt=0.01, substeps=10):
+    def __init__(self, width, height, physical_width=10.0, dt=0.01, substeps=10, 
+                 pinned_vertices=None, pin_mode='top_edge'):
         """
         [Resolution Independent Setup]
         width, height: 파티클 격자의 해상도 (개수)
         physical_width: 천의 실제 물리적 가로 길이 (미터)
+        pinned_vertices: 고정할 vertex 인덱스 리스트 (직접 지정)
+        pin_mode: 사전 정의된 고정 모드
+            - 'none': 고정 없음 (기본값, 떨어지는 시나리오)
+            - 'top_edge': 상단 가장자리 전체 고정 (커튼/깃발)
+            - 'top_corners': 상단 양쪽 모서리만 고정
+            - 'four_corners': 네 모서리 고정
+            - 'top_row': 맨 위 한 줄 고정
+            - 'custom': pinned_vertices로 직접 지정
         """
         self.dt = dt
         self.substeps = substeps
@@ -36,6 +69,10 @@ class ClothSimulator:
         
         # 물리적 세로 길이 (정사각형 격자 가정)
         physical_height = spacing * (height - 1)
+        
+        # [NEW] 고정 vertex 설정
+        self.pin_mode = pin_mode
+        self.pinned_indices = self._compute_pinned_indices(width, height, pin_mode, pinned_vertices)
 
         print(f"🎓 Simulation Init: Resolution=({width}x{height})")
         print(f"   -> Physical Size=({physical_width:.2f}m x {physical_height:.2f}m)")
@@ -126,7 +163,15 @@ class ClothSimulator:
         ref_spacing = 0.1
         particle_mass = (spacing / ref_spacing) ** 2 
         mass_inv = np.ones(num_particles, dtype=np.float32) * (1.0 / particle_mass)
+        
+        # [NEW] 고정 vertex는 mass_inv = 0 (움직이지 않음)
+        for idx in self.pinned_indices:
+            mass_inv[idx] = 0.0
+        
         self.d_mass_inv = cuda.to_device(mass_inv)
+        
+        if len(self.pinned_indices) > 0:
+            print(f"   -> Pinned Vertices: {len(self.pinned_indices)} particles (mode='{self.pin_mode}')")
 
         # 제약 조건 데이터 업로드
         self.d_constraints = cuda.to_device(np.array(constraints, dtype=np.int32))
@@ -142,6 +187,10 @@ class ClothSimulator:
         # Self-Collision 파라미터
         self.thickness = spacing * 0.7
         self.collision_margin = self.thickness * 0.5
+        
+        # [Phase 2 최적화] 동적 셀 크기 계산
+        self.cell_size = compute_optimal_cell_size(spacing, self.thickness)
+        print(f"   -> [OPT] Dynamic Cell Size: {self.cell_size:.4f} (spacing={spacing:.4f}, thickness={self.thickness:.4f})")
         
         # 디버깅/시각화용 Penetration 버퍼
         self.d_penetration = cuda.device_array(self.num_particles, dtype=np.float32)
@@ -198,7 +247,50 @@ class ClothSimulator:
 
         # 곡률 기반 컬링
         self.d_curvature = cuda.device_array(self.num_particles, dtype=np.float32)
-        self.curvature_threshold = 0.002
+        # [개선] 해상도 독립성을 위한 정규화 파라미터
+        # 곡률 임계값은 정규화된 값으로, 해상도에 무관하게 동일한 값 사용 가능
+        self.spacing_sq = spacing * spacing  # h² for normalization
+        self.curvature_threshold = 0.15      # 정규화된 임계값 (이전 0.002에서 조정)
+        self.use_curvature_culling = True    # 곡률 기반 컬링 활성화 (기본값)
+        
+        # [GPU 최적화] Shared Memory Tiling 사용 여부
+        # 고해상도(512x512 이상)에서 자동 활성화하여 Global Memory 접근 최소화
+        self.use_tiled_curvature = (width >= 256 and height >= 256)
+        
+        # =============================================================================
+        # [Phase 1 최적화] 융합 커널 사용 여부
+        # =============================================================================
+        self.use_fused_kernel = True  # Curvature + Hash 융합 커널 사용
+        
+        # =============================================================================
+        # [Phase 1 최적화] Adaptive Curvature Threshold
+        # =============================================================================
+        self.adaptive_threshold_enabled = True
+        self.base_curvature_threshold = 0.15  # 기본 임계값
+        self.min_curvature_threshold = 0.08   # 최소 임계값 (격렬한 변형 시)
+        self.max_curvature_threshold = 0.30   # 최대 임계값 (안정 시)
+        self.last_avg_velocity = 0.0          # 이전 프레임 평균 속도
+        self.last_max_penetration = 0.0       # 이전 프레임 최대 침투
+        
+        # =============================================================================
+        # [Phase 3 최적화] Adaptive Substeps
+        # =============================================================================
+        self.adaptive_substeps_enabled = True
+        self.base_substeps = substeps
+        self.min_substeps = max(5, substeps // 2)   # 최소 substep (안정 시)
+        self.max_substeps = substeps + 5            # 최대 substep (불안정 시)
+        self.current_substeps = substeps            # 현재 사용 중인 substep 수
+        
+        # =============================================================================
+        # [Phase 4 최적화] Jacobi Distance Constraint (선택적)
+        # =============================================================================
+        self.use_jacobi_constraint = False  # 기본값: Graph Coloring 방식 사용
+        self.jacobi_relaxation = 0.8        # Under-relaxation 계수
+        self.jacobi_iterations = 2          # Jacobi iteration 수
+        
+        # Jacobi용 버퍼
+        self.d_pos_delta = cuda.device_array((self.num_particles, 3), dtype=np.float32)
+        self.d_delta_count = cuda.device_array(self.num_particles, dtype=np.int32)
 
         # =============================================================================
         # [NEW] 시공간 코히어런스 (Spatio-Temporal Coherence) 버퍼
@@ -222,12 +314,15 @@ class ClothSimulator:
         
         # 통계/디버깅용 카운터
         self.d_update_counter = cuda.to_device(np.array([0], dtype=np.int32))
+        self.d_active_pair_count = cuda.to_device(np.array([0], dtype=np.int32))
         self.last_update_ratio = 1.0  # 마지막 프레임의 갱신 비율
         
         # 시공간 코히어런스 활성화 플래그
         self.use_temporal_coherence = True
         
         print(f"   -> [NEW] Temporal Coherence: motion_threshold={self.motion_threshold:.6f}, max_cache_age={self.max_cache_age}")
+        print(f"   -> [OPT] Fused Kernel: {self.use_fused_kernel}, Adaptive Threshold: {self.adaptive_threshold_enabled}")
+        print(f"   -> [OPT] Adaptive Substeps: {self.adaptive_substeps_enabled} (range: {self.min_substeps}-{self.max_substeps})")
 
 # ---------------------------------------------------------
         # [GPU Memory Usage Info] 초기화 후 메모리 사용량 출력
@@ -261,79 +356,120 @@ class ClothSimulator:
             print(f"[Warning] Failed to get GPU memory info: {e}")
 
     def _sort_particles_torch(self):
+        """
+        [최적화] 단순화된 정렬 - GPU 동기화 최소화
+        
+        이전 방식의 문제점:
+        1. valid_mask.sum().item() → GPU→CPU 동기화 (블로킹)
+        2. 마스킹 + 인덱싱 + cat → 추가 메모리 할당
+        
+        새로운 방식:
+        - 전체 배열을 그대로 정렬 (hash=-1인 파티클은 앞으로 정렬됨)
+        - GPU 동기화 최소화
+        - 메모리 할당 최소화
+        """
         # 1. [Sync Numba] 시작 전 대기
         cuda.synchronize()
 
-        # 타이머 시작 (여기서부터 정렬 단계로 간주)
+        # 타이머 시작
         t_start = time.perf_counter() 
 
         # --- PyTorch 영역 ---
         hashes_torch = torch.as_tensor(self.d_particle_hashes, device='cuda')
         indices_torch = torch.as_tensor(self.d_particle_indices, device='cuda')
         
-        sorted_indices = torch.argsort(hashes_torch, descending=False, stable=True)
+        # [최적화] 단순 정렬 - hash=-1은 자연스럽게 앞으로 정렬됨
+        # argsort는 안정 정렬이므로 동일 해시값의 상대 순서 유지
+        sorted_order = torch.argsort(hashes_torch, descending=False, stable=True)
+        hashes_sorted = hashes_torch[sorted_order].contiguous()
+        indices_sorted = indices_torch[sorted_order].contiguous()
         
-        hashes_sorted = hashes_torch[sorted_indices].contiguous()
-        indices_sorted = indices_torch[sorted_indices].contiguous()
+        # 컬링 비율 계산 (hash != -1인 파티클 개수)
+        num_valid = (hashes_torch != -1).sum().item()
         
         # [Sync PyTorch] PyTorch 작업 완료 대기
         torch.cuda.synchronize()
         # --- PyTorch 영역 끝 ---
 
         # 3. PyTorch -> Numba (데이터 덮어쓰기)
-        # 이 작업들도 정렬 시간에 포함되어야 합니다.
         sorted_hashes_cuda = cuda.as_cuda_array(hashes_sorted)
         sorted_indices_cuda = cuda.as_cuda_array(indices_sorted)
         
-        # 비동기 복사 명령 내림
         self.d_particle_hashes.copy_to_device(sorted_hashes_cuda)
         self.d_particle_indices.copy_to_device(sorted_indices_cuda)
 
-        # ==================================================================
-        # [핵심 수정] 마지막 Numba 복사 작업이 끝날 때까지 기다려야 합니다.
-        # ==================================================================
-        cuda.synchronize() # Numba 스트림 완료 대기
+        cuda.synchronize()
 
-        # 타이머 종료 (모든 데이터 이동이 완료된 후 측정)
         t_end = time.perf_counter()
-
-        # 걸린 시간 저장 (단위: 초)
         self.last_sort_time = t_end - t_start
+        
+        # 디버깅용: 컬링 비율 저장
+        self.last_culling_ratio = 1.0 - (num_valid / self.num_particles) if self.num_particles > 0 else 0.0
 
+    def _update_adaptive_parameters(self):
+        """
+        [Phase 1 & 3 최적화] 시뮬레이션 상태에 따라 파라미터 동적 조절
+        """
+        # =================================================================
+        # Adaptive Curvature Threshold
+        # =================================================================
+        if self.adaptive_threshold_enabled:
+            # 속도 기반 조절: 빠른 움직임 → 낮은 임계값 (더 정확)
+            velocity_factor = min(1.0, self.last_avg_velocity / 5.0)  # 0~1 정규화
+            
+            # 침투 기반 조절: 높은 침투 → 낮은 임계값 (더 정확)
+            penetration_factor = min(1.0, self.last_max_penetration / 0.01)  # 0~1 정규화
+            
+            # 종합 요소 (높을수록 불안정)
+            instability = max(velocity_factor, penetration_factor)
+            
+            # 임계값 계산: 불안정할수록 낮은 임계값
+            threshold_range = self.max_curvature_threshold - self.min_curvature_threshold
+            self.curvature_threshold = self.max_curvature_threshold - (instability * threshold_range)
+        
+        # =================================================================
+        # Adaptive Substeps
+        # =================================================================
+        if self.adaptive_substeps_enabled:
+            # 속도와 침투 기반으로 substep 수 결정
+            if self.last_avg_velocity < 1.0 and self.last_max_penetration < 0.002:
+                # 안정 상태: 적은 substep
+                self.current_substeps = self.min_substeps
+            elif self.last_avg_velocity > 8.0 or self.last_max_penetration > 0.008:
+                # 불안정 상태: 많은 substep
+                self.current_substeps = self.max_substeps
+            else:
+                # 중간 상태: 기본 substep
+                self.current_substeps = self.base_substeps
+    
     def step(self):
-        # clear_counter_kernel[1, 1](self.d_debug_skip_count)
         target_compliance = 0.0       # 완전 딱딱함 (비신축성, 실크/면)
-        # target_compliance = 0.00001   # 아주 약간 늘어남 (나일론)
-        # target_compliance = 0.005     # 고무줄/스판덱스
-        # target_compliance = 0.0000001 # 거의 0에 가깝게 설정하여 기존 천 느낌 유지
         self.frame_count += 1
+        
+        # =================================================================
+        # [Phase 1 & 3 최적화] Adaptive 파라미터 업데이트
+        # =================================================================
+        self._update_adaptive_parameters()
+        
+        # Adaptive Substeps 적용
+        current_substeps = self.current_substeps if self.adaptive_substeps_enabled else self.substeps
+        dt_sub = self.dt / current_substeps
 
-        dt_sub = self.dt / self.substeps
-
-        for _ in range(self.substeps):
+        for _ in range(current_substeps):
                 
             # ------------------------------------------------------------------
             # [Stage 0] External Forces (Aerodynamics)
             # ------------------------------------------------------------------
-            # 바람에 의한 양력/항력을 계산하여 현재 속도(vel)에 선반영
             blocks_faces = (self.num_faces + self.threads_per_block - 1) // self.threads_per_block
             
             apply_aerodynamics_kernel[blocks_faces, self.threads_per_block](
-                self.d_pos,         # Position (for Normal calc)
-                self.d_vel,         # Velocity (Force applied here)
-                self.d_faces,       # Topology
-                self.wind_vel,      # Wind Vector
-                self.rho,           # Air Density
-                self.drag_coeff,    # Cd
-                self.lift_coeff,    # Cl
-                dt_sub,             # Time step
-                self.num_faces
+                self.d_pos, self.d_vel, self.d_faces, self.wind_vel,
+                self.rho, self.drag_coeff, self.lift_coeff, dt_sub, self.num_faces
             )
 
             # ------------------------------------------------------------------
             # [Stage 1] Prediction & Integration
             # ------------------------------------------------------------------
-            # 중력 적용 및 위치 예측 (Explicit Integration)
             predict_position_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_pos, self.d_vel, self.d_pos_pred, self.d_mass_inv, 
                 dt_sub, -9.8, self.num_particles
@@ -342,90 +478,126 @@ class ClothSimulator:
             # ------------------------------------------------------------------
             # [Stage 1.5] Environment Collision (Sphere SDF)
             # ------------------------------------------------------------------
-            # 예측된 위치가 구 안으로 들어갔다면 즉시 밀어냄
             solve_environment_collision_kernel[self.blocks_particles, self.threads_per_block](
-                self.d_pos_pred,    
-                self.d_pos,         
-                self.d_mass_inv,
-                self.sphere_params,
-                self.sphere_friction, # 구 마찰
-                self.floor_height,    # [NEW] 바닥 높이
-                self.floor_friction,  # [NEW] 바닥 마찰
-                dt_sub,
-                self.num_particles,
-                self.collision_margin
+                self.d_pos_pred, self.d_pos, self.d_mass_inv,
+                self.sphere_params, self.sphere_friction,
+                self.floor_height, self.floor_friction,
+                dt_sub, self.num_particles, self.collision_margin
             )
+            
             # ------------------------------------------------------------------
-            # [Stage 2] Distance Constraints (XPBD + Graph Coloring)
+            # [Stage 2] Distance Constraints (XPBD)
             # ------------------------------------------------------------------
-            # Graph Coloring으로 병렬화된 거리 제약 조건 해결
-            for d_batch in self.d_color_batches:
-                blocks_batch = (d_batch.shape[0] + self.threads_per_block - 1) // self.threads_per_block
+            if self.use_jacobi_constraint:
+                # [Phase 4 최적화] Jacobi 방식 (단일 커널)
+                blocks_constraints = (self.num_constraints + self.threads_per_block - 1) // self.threads_per_block
+                
+                for _ in range(self.jacobi_iterations):
+                    # 버퍼 초기화
+                    self.d_pos_delta[:] = 0.0
+                    self.d_delta_count[:] = 0
+                    
+                    # 모든 제약 병렬 처리
+                    solve_distance_constraint_jacobi_kernel[blocks_constraints, self.threads_per_block](
+                        self.d_pos_pred, self.d_pos_delta, self.d_delta_count,
+                        self.d_mass_inv, self.d_constraints, self.d_rest_lengths,
+                        dt_sub, target_compliance, self.num_constraints
+                    )
+                    
+                    # 보정값 적용 (평균화 + under-relaxation)
+                    apply_jacobi_correction_kernel[self.blocks_particles, self.threads_per_block](
+                        self.d_pos_pred, self.d_pos_delta, self.d_delta_count,
+                        self.jacobi_relaxation, self.num_particles
+                    )
+            else:
+                # 기존 방식: Graph Coloring
+                for d_batch in self.d_color_batches:
+                    blocks_batch = (d_batch.shape[0] + self.threads_per_block - 1) // self.threads_per_block
+                    solve_distance_constraint_colored_kernel[blocks_batch, self.threads_per_block](
+                        self.d_pos_pred, self.d_mass_inv, self.d_constraints, self.d_rest_lengths,
+                        d_batch, dt_sub, target_compliance
+                    )
 
-                solve_distance_constraint_colored_kernel[blocks_batch, self.threads_per_block](
-                    self.d_pos_pred, self.d_mass_inv, self.d_constraints, self.d_rest_lengths,
-                    d_batch, dt_sub, target_compliance
-                )
-
             # ------------------------------------------------------------------
-            # [Stage 3] Self-Collision (Spatial Hashing + Temporal Coherence)
+            # [Stage 3] Self-Collision (Optimized Pipeline)
             # ------------------------------------------------------------------
             # 3-0. Reset Grid
             self.d_cell_start[:] = -1 
             self.d_cell_end[:] = -1
             self.d_penetration[:] = 0.0
 
-            threads_1d = 256
-            blocks_1d = int(math.ceil(self.num_particles / threads_1d))
-
-            # =============================================================================
-            # [NEW] 시공간 코히어런스 적용
-            # =============================================================================
-            if self.use_temporal_coherence:
-                # 3-1. 갱신 마스크 계산: 어떤 파티클이 곡률 재계산이 필요한지 판단
-                compute_update_mask_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
-                    self.d_pos,              # 현재 위치
-                    self.d_pos_cache,        # 캐시된 위치
-                    self.d_cache_age,        # 캐시 나이
-                    self.d_update_mask,      # 출력: 갱신 필요 여부
-                    self.motion_threshold,   # 움직임 임계값
-                    self.max_cache_age,      # 최대 캐시 나이
-                    self.num_x, self.num_y
+            # =================================================================
+            # [최적화] 단계적 컬링 파이프라인 - 융합 커널 우선 사용
+            # =================================================================
+            if self.use_curvature_culling and self.use_temporal_coherence:
+                # [최적화 경로 1] Temporal Coherence + Curvature + Hash 융합 커널
+                # full_optimization에서 3개 커널을 1개로 통합하여 오버헤드 제거
+                fused_temporal_curvature_hash_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                    self.d_pos, self.d_pos_pred,
+                    self.d_pos_cache, self.d_cache_age, self.d_update_mask,
+                    self.d_curvature, self.d_curvature_cache,
+                    self.d_particle_hashes, self.d_particle_indices,
+                    self.num_x, self.num_y, self.spacing_sq,
+                    self.curvature_threshold, self.motion_threshold, self.max_cache_age,
+                    self.cell_size, HASH_TABLE_SIZE
                 )
-                
-                # 3-2. 선택적 곡률 계산: 필요한 파티클만 재계산, 나머지는 캐시 사용
-                compute_curvature_selective_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
-                    self.d_pos,              # 현재 위치
-                    self.d_curvature,        # 출력 곡률
-                    self.d_curvature_cache,  # 캐시된 곡률
-                    self.d_pos_cache,        # 캐시된 위치 (갱신용)
-                    self.d_cache_age,        # 캐시 나이
-                    self.d_update_mask,      # 갱신 필요 여부
-                    self.num_x, self.num_y
-                )
+            elif self.use_fused_kernel and not self.use_temporal_coherence:
+                # [최적화 경로 2] Curvature + Hash 융합 커널 (Temporal Coherence 없음)
+                if self.use_tiled_curvature:
+                    # Tiled 융합 커널 (Shared Memory 활용)
+                    tiled_blocks_x = int(np.ceil(self.num_x / TILE_SIZE))
+                    tiled_blocks_y = int(np.ceil(self.num_y / TILE_SIZE))
+                    fused_curvature_hash_tiled_kernel[(tiled_blocks_x, tiled_blocks_y), (TILE_SIZE, TILE_SIZE)](
+                        self.d_pos, self.d_pos_pred,
+                        self.d_curvature, self.d_particle_hashes, self.d_particle_indices,
+                        self.num_x, self.num_y, self.spacing_sq,
+                        self.curvature_threshold, self.cell_size, HASH_TABLE_SIZE
+                    )
+                else:
+                    # 기본 융합 커널
+                    fused_curvature_hash_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                        self.d_pos, self.d_pos_pred,
+                        self.d_curvature, self.d_particle_hashes, self.d_particle_indices,
+                        self.num_x, self.num_y, self.spacing_sq,
+                        self.curvature_threshold, self.cell_size, HASH_TABLE_SIZE
+                    )
             else:
-                # 기존 방식: 매 substep 전체 재계산
-                compute_curvature_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
-                    self.d_pos, 
-                    self.d_curvature, 
-                    self.num_x, 
-                    self.num_y
+                # [기존 경로] 별도 커널 사용 (Temporal Coherence만 사용하거나 컬링 없음)
+                threads_1d = 256
+                blocks_1d = int(math.ceil(self.num_particles / threads_1d))
+                
+                if self.use_temporal_coherence:
+                    # 시공간 코히어런스 적용 (이 경로는 위에서 처리되므로 여기 도달하지 않음)
+                    compute_update_mask_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                        self.d_pos, self.d_pos_cache, self.d_cache_age, self.d_update_mask,
+                        self.motion_threshold, self.max_cache_age, self.num_x, self.num_y
+                    )
+                    
+                    compute_curvature_selective_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                        self.d_pos, self.d_curvature, self.d_curvature_cache,
+                        self.d_pos_cache, self.d_cache_age, self.d_update_mask,
+                        self.num_x, self.num_y, self.spacing_sq
+                    )
+                else:
+                    # 기존 방식
+                    if self.use_tiled_curvature:
+                        tiled_blocks_x = int(np.ceil(self.num_x / TILE_SIZE))
+                        tiled_blocks_y = int(np.ceil(self.num_y / TILE_SIZE))
+                        compute_curvature_tiled_kernel[(tiled_blocks_x, tiled_blocks_y), (TILE_SIZE, TILE_SIZE)](
+                            self.d_pos, self.d_curvature, self.num_x, self.num_y, self.spacing_sq
+                        )
+                    else:
+                        compute_curvature_kernel[self.blocks_per_grid_2d, self.threads_per_block_2d](
+                            self.d_pos, self.d_curvature, self.num_x, self.num_y, self.spacing_sq
+                        )
+                
+                # 해시 계산 (별도 커널)
+                compute_hash_kernel_v2[blocks_1d, threads_1d](
+                    self.d_pos_pred, self.d_particle_hashes, self.d_particle_indices,
+                    self.d_cell_start, self.d_cell_end, self.d_curvature,
+                    self.curvature_threshold, self.num_particles, CELL_SIZE, HASH_TABLE_SIZE
                 )
-            # =============================================================================
-
-            # 3-3. Compute Hash (곡률 기반 컬링 포함)
-            compute_hash_kernel_v2[blocks_1d, threads_1d](
-                self.d_pos_pred,             # 1. 위치
-                self.d_particle_hashes,      # 2. 해시값 저장소
-                self.d_particle_indices,     # 3. 파티클 ID 저장소 (정렬용)
-                self.d_cell_start,           # 4. (Dummy)
-                self.d_cell_end,             # 5. (Dummy)
-                self.d_curvature,            # 6. 곡률
-                self.curvature_threshold,    # 7. 임계값
-                self.num_particles,          # 8. 파티클 수
-                CELL_SIZE,                   # 9. 셀 크기
-                HASH_TABLE_SIZE              # 10. 해시 테이블 크기
-            )
+            # =================================================================
 
             # 3-3. Sort Particles (PyTorch Radix Sort - Zero Copy)
             self._sort_particles_torch()
@@ -435,7 +607,13 @@ class ClothSimulator:
                 self.d_particle_hashes, self.d_cell_start, self.d_cell_end, self.num_particles
             )
 
-            # 3-5. Solve Collision with Friction
+            # 3-5. Solve Collision with Friction (다단계 Culling 적용)
+            # Curvature threshold: use_curvature_culling이 True면 실제 임계값, 아니면 0 (모든 파티클 통과)
+            curv_thresh = self.curvature_threshold if self.use_curvature_culling else 0.0
+            
+            # Active pair 카운터 초기화
+            self.d_active_pair_count[0] = 0
+            
             solve_self_collision_friction_kernel[self.blocks_particles, self.threads_per_block](
                 self.d_pos_pred,        # Candidate Position
                 self.d_pos,             # Previous Position (for relative velocity)
@@ -445,7 +623,9 @@ class ClothSimulator:
                 self.num_particles, self.thickness, self.d_penetration,
                 dt_sub,
                 self.d_visibility, self.frame_count,
-                self.d_debug_skip_count
+                self.d_debug_skip_count,
+                self.d_curvature, curv_thresh,
+                self.d_active_pair_count
             )
 
             # ------------------------------------------------------------------
@@ -456,9 +636,19 @@ class ClothSimulator:
                 self.d_pos, self.d_vel, self.d_pos_pred, dt_sub, self.num_particles
             )
 
-        # skipped = self.d_debug_skip_count.copy_to_host()[0]
-        # total = self.num_particles * self.substeps
-        # print(f"   [DEBUG] Skipped Collisions: {skipped} / {total} ({skipped/total*100:.1f}%)")
+        # =================================================================
+        # [Phase 1 & 3 최적화] 다음 프레임을 위한 통계 수집
+        # =================================================================
+        if self.adaptive_threshold_enabled or self.adaptive_substeps_enabled:
+            # 속도 통계 (GPU에서 직접 계산하면 더 빠르지만, 간단히 CPU에서 계산)
+            # 매 프레임 전체 복사는 비효율적이므로, 샘플링 또는 주기적 업데이트 권장
+            if self.frame_count % 5 == 0:  # 5프레임마다 업데이트
+                vel_host = self.d_vel.copy_to_host()
+                vel_magnitudes = np.linalg.norm(vel_host, axis=1)
+                self.last_avg_velocity = np.mean(vel_magnitudes)
+                
+                penetration_host = self.d_penetration.copy_to_host()
+                self.last_max_penetration = np.max(penetration_host)
 
     def get_positions(self):
         return self.d_pos.copy_to_host()
@@ -499,6 +689,140 @@ class ClothSimulator:
         Returns: float (0.0 ~ 1.0)
         """
         return 1.0 - self.get_update_ratio()
+    
+    # =========================================================================
+    # [NEW] Pinned Vertex (고정 파티클) 관련 메서드
+    # =========================================================================
+    def _compute_pinned_indices(self, width, height, pin_mode, pinned_vertices):
+        """
+        pin_mode에 따라 고정할 vertex 인덱스 리스트 계산
+        
+        그리드 레이아웃:
+        - idx = y * width + x
+        - y=0: 맨 아래 (바닥 근처)
+        - y=height-1: 맨 위
+        - x=0: 왼쪽, x=width-1: 오른쪽
+        """
+        if pin_mode == 'none':
+            return []
+        
+        if pin_mode == 'custom' and pinned_vertices is not None:
+            return list(pinned_vertices)
+        
+        if pin_mode == 'top_edge':
+            # 상단 가장자리 전체 (y = height - 1)
+            return [((height - 1) * width + x) for x in range(width)]
+        
+        if pin_mode == 'top_corners':
+            # 상단 양쪽 모서리만
+            top_left = (height - 1) * width + 0
+            top_right = (height - 1) * width + (width - 1)
+            return [top_left, top_right]
+        
+        if pin_mode == 'four_corners':
+            # 네 모서리
+            top_left = (height - 1) * width + 0
+            top_right = (height - 1) * width + (width - 1)
+            bottom_left = 0
+            bottom_right = width - 1
+            return [top_left, top_right, bottom_left, bottom_right]
+        
+        if pin_mode == 'top_row':
+            # 맨 위 한 줄 (= top_edge와 동일)
+            return [((height - 1) * width + x) for x in range(width)]
+        
+        # 알 수 없는 모드
+        print(f"   [Warning] Unknown pin_mode '{pin_mode}', no vertices pinned.")
+        return []
+    
+    def pin_vertex(self, idx):
+        """
+        런타임에 특정 vertex를 고정
+        
+        Args:
+            idx: 고정할 vertex 인덱스 (int) 또는 인덱스 리스트
+        """
+        if isinstance(idx, (list, tuple, np.ndarray)):
+            indices = list(idx)
+        else:
+            indices = [idx]
+        
+        # GPU에서 mass_inv 가져오기
+        mass_inv = self.d_mass_inv.copy_to_host()
+        
+        for i in indices:
+            if 0 <= i < self.num_particles:
+                mass_inv[i] = 0.0
+                if i not in self.pinned_indices:
+                    self.pinned_indices.append(i)
+        
+        # GPU로 다시 업로드
+        self.d_mass_inv = cuda.to_device(mass_inv)
+    
+    def unpin_vertex(self, idx):
+        """
+        런타임에 특정 vertex 고정 해제
+        
+        Args:
+            idx: 고정 해제할 vertex 인덱스 (int) 또는 인덱스 리스트
+        """
+        if isinstance(idx, (list, tuple, np.ndarray)):
+            indices = list(idx)
+        else:
+            indices = [idx]
+        
+        # GPU에서 mass_inv 가져오기
+        mass_inv = self.d_mass_inv.copy_to_host()
+        
+        # 원래 mass 계산
+        ref_spacing = 0.1
+        particle_mass = (self.spacing / ref_spacing) ** 2
+        original_mass_inv = 1.0 / particle_mass
+        
+        for i in indices:
+            if 0 <= i < self.num_particles:
+                mass_inv[i] = original_mass_inv
+                if i in self.pinned_indices:
+                    self.pinned_indices.remove(i)
+        
+        # GPU로 다시 업로드
+        self.d_mass_inv = cuda.to_device(mass_inv)
+    
+    def unpin_all(self):
+        """모든 고정 해제"""
+        self.unpin_vertex(self.pinned_indices.copy())
+    
+    def get_pinned_indices(self):
+        """현재 고정된 vertex 인덱스 리스트 반환"""
+        return self.pinned_indices.copy()
+    
+    def is_pinned(self, idx):
+        """특정 vertex가 고정되어 있는지 확인"""
+        return idx in self.pinned_indices
+    
+    def pin_by_position(self, condition_fn):
+        """
+        위치 조건에 따라 vertex 고정
+        
+        Args:
+            condition_fn: (x, y, z) -> bool 함수
+                          True를 반환하면 해당 vertex 고정
+        
+        Example:
+            # y > 5.0인 모든 vertex 고정
+            sim.pin_by_position(lambda x, y, z: y > 5.0)
+        """
+        pos = self.get_positions()
+        indices_to_pin = []
+        
+        for i in range(self.num_particles):
+            x, y, z = pos[i]
+            if condition_fn(x, y, z):
+                indices_to_pin.append(i)
+        
+        if indices_to_pin:
+            self.pin_vertex(indices_to_pin)
+            print(f"   -> Pinned {len(indices_to_pin)} vertices by position condition")
     
     def set_temporal_coherence(self, enabled, motion_threshold=None, max_cache_age=None):
         """
